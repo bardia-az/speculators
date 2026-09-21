@@ -6,8 +6,8 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
-[tool.uv.workspace]
-members = ["hs_connectors"]
+# [tool.uv.workspace]       # Added to the root to avoid nested workspaces
+# members = ["hs_connectors"]
 
 [tool.uv.sources]
 hs-connectors = { workspace = true }
