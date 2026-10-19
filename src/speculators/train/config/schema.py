@@ -312,10 +312,10 @@ class LossArgs(_Group):
     loss_fn: str | None = Field(
         default=None,
         description="Loss function specification. A name (kl_div, rkl, jsd, ce, tv, "
-        'nla, lk_hybrid, tau_rb) or a JSON dict for a weighted combination, e.g. '
+        "nla, lk_hybrid, tau_rb) or a JSON dict for a weighted combination, e.g. "
         '\'{"ce": 0.1, "tv": 0.9}\'. tau_rb is the exact accepted-length loss '
         "(computed with block context; combine it with kl_div or start from a "
-        'pretrained checkpoint, since acceptance-type losses have weak gradients '
+        "pretrained checkpoint, since acceptance-type losses have weak gradients "
         'when the drafter is far from the target). (default: "ce" for dflash, '
         '"kl_div" otherwise).',
     )
@@ -485,10 +485,14 @@ class DFlashArgs(_Group):
     dflash_decay_gamma: float = Field(
         default=4.0, description="Decay gamma for DFlash-family loss weighting."
     )
-    per_position_loss_weight: Literal["fixed-exp-decay", "dpace"] | None = Field(
-        default=None,
-        description="Per-position loss weight option for D-PACE support "
-        "(default: dpace for dflash, fixed-exp-decay otherwise).",
+    per_position_loss_weight: Literal["fixed-exp-decay", "dpace", "none"] | None = (
+        Field(
+            default=None,
+            description="Per-position loss weight option. 'none' disables the "
+            "positional decay (uniform weights) — for the tau_rb loss, whose "
+            "survival chain already models continuation compounding (default: "
+            "dpace for dflash, fixed-exp-decay otherwise).",
+        )
     )
     dpace_alpha: float = Field(
         default=0.5,
@@ -753,10 +757,11 @@ class TrainConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _validate_dpace(self) -> "TrainConfig":
+    def _validate_per_position_loss_weight(self) -> "TrainConfig":
         """D-PACE per-position loss weighting requires CE loss and a smoothing constant
         in ``(0, 1]``. Only enforced when actually selected, so it never fires on a
-        default (``fixed-exp-decay``) run."""
+        default (``fixed-exp-decay``) run. ``none`` (uniform weights, for the
+        tau_rb loss) is dflash-only; dspark/dflash2 keep their decay dispatch."""
         if self.dflash.per_position_loss_weight == "dpace":
             if self.loss.loss_fn != "ce":
                 raise ValueError(
@@ -766,6 +771,14 @@ class TrainConfig(BaseSettings):
                 raise ValueError(
                     f"--dpace-alpha must be in (0, 1], got {self.dflash.dpace_alpha}"
                 )
+        if (
+            self.dflash.per_position_loss_weight == "none"
+            and self.speculator_type != "dflash"
+        ):
+            raise ValueError(
+                "--per-position-loss-weight=none is only implemented for "
+                "--speculator-type=dflash"
+            )
         return self
 
     def flatten(self) -> dict[str, Any]:

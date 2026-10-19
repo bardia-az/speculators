@@ -21,11 +21,43 @@ from speculators.models.metrics import (
 _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (kl_div_loss, 1.0)}
 
 
+def _select_decay_fn(
+    per_position_loss_weight: str,
+    *,
+    loss_mask: torch.Tensor,
+    block_size: int,
+    gamma: float,
+    dpace_alpha: float,
+    sample_from_anchor: bool,
+) -> Any:
+    """Positional weighting applied to the per-position loss terms.
+
+    "dpace" selects the confidence-based D-PACE weighting, "none" disables
+    the decay (uniform weights — for the tau_rb loss, whose survival chain
+    already models how an early-slot miss cuts the continuation; a positional
+    decay would double-count that compounding), and anything else (the
+    "fixed-exp-decay" default) the DFlash exponential decay.
+    """
+    if per_position_loss_weight == "dpace":
+        return partial(
+            dpace_loss_decay,
+            loss_mask=loss_mask,
+            block_size=block_size,
+            dpace_alpha=dpace_alpha,
+        )
+    if per_position_loss_weight == "none":
+        return None
+    return partial(
+        dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
+    )
+
+
 def compute_metrics(
     logits: torch.Tensor,  # shape: [1, num_anchors*block_size, draft_vocab_size]
     targets: torch.Tensor,  # shape: [1, num_anchors*block_size, draft_vocab_size]
     loss_mask: torch.Tensor,  # shape: [1, num_anchors*block_size]
     block_size: int = 1,
+    *,
     gamma: float = 4.0,
     loss_config: LossConfig | None = None,
     per_position_loss_weight: str = "fixed-exp-decay",
@@ -97,17 +129,14 @@ def compute_metrics(
         else:
             per_position_config[name] = spec
 
-    if per_position_loss_weight == "dpace":
-        decay_fn = partial(
-            dpace_loss_decay,
-            loss_mask=loss_mask,
-            block_size=block_size,
-            dpace_alpha=dpace_alpha,
-        )
-    else:
-        decay_fn = partial(
-            dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
-        )
+    decay_fn = _select_decay_fn(
+        per_position_loss_weight,
+        loss_mask=loss_mask,
+        block_size=block_size,
+        gamma=gamma,
+        dpace_alpha=dpace_alpha,
+        sample_from_anchor=sample_from_anchor,
+    )
 
     loss, term_losses = compound_loss(
         logits,
