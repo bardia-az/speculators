@@ -6,7 +6,9 @@ import pytest
 import torch
 
 from speculators.losses import dflash_loss_decay, loss_function, resolve_loss_config
+from speculators.losses import eager
 from speculators.losses.eager import ce_loss
+from speculators.losses.tau_rb import tau_rb_block_loss
 from speculators.models.dflash.metrics import compute_metrics as _compute_metrics
 from speculators.models.metrics import compute_accuracy_multi_step
 
@@ -395,3 +397,95 @@ class TestExpectedAcceptedLength:
         )
         assert metrics["eal_total"].item() == pytest.approx(1.0)
         assert metrics["eal_sum"].item() == pytest.approx(4.0)
+
+
+class TestTauRbIntegration:
+    """tau_rb flows through compute_metrics alongside per-position terms."""
+
+    block_size = 4
+
+    def _make_inputs(self, seed=7):
+        gen = torch.Generator().manual_seed(seed)
+        vocab = 6
+        seq = 2 * self.block_size
+        logits = torch.randn(1, seq, vocab, generator=gen)
+        targets = torch.randn(1, seq, vocab, generator=gen)
+        token_ids = torch.randint(0, vocab, (1, seq), generator=gen)
+        # second block truncated at its last slot
+        loss_mask = torch.tensor(
+            [[0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0]]
+        )
+        return logits, targets, token_ids, loss_mask
+
+    def test_registry_accepts_tau_rb(self):
+        for implementation in ("eager", "fused"):
+            config = resolve_loss_config("tau_rb", implementation)
+            assert set(config) == {"tau_rb"}
+        mixed = resolve_loss_config('{"kl_div": 0.1, "tau_rb": 0.9}', "eager")
+        assert set(mixed) == {"kl_div", "tau_rb"}
+
+    def test_mixed_config_combines_terms(self):
+        logits, targets, token_ids, loss_mask = self._make_inputs()
+        config = resolve_loss_config('{"kl_div": 0.1, "tau_rb": 0.9}', "eager")
+        loss, metrics = _compute_metrics(
+            logits,
+            targets,
+            loss_mask,
+            self.block_size,
+            loss_config=config,
+            token_ids=token_ids,
+        )
+
+        pos_idx = torch.arange(8).unsqueeze(0) % self.block_size
+        kl_term = loss_function(
+            logits,
+            targets,
+            loss_mask,
+            pos_idx,
+            loss_fn=eager.kl_div_loss,
+            decay_fn=partial(dflash_loss_decay, gamma=4.0),
+        )
+        tau_term, _ = tau_rb_block_loss(
+            logits, targets, token_ids, loss_mask, self.block_size
+        )
+        assert loss.item() == pytest.approx(
+            (0.1 * kl_term + 0.9 * tau_term).item(), abs=1e-5
+        )
+        assert metrics["tau_rb_loss_total"].item() == 1.0
+        assert metrics["tau_rb_tau_hat_total"].item() == 2.0
+        for slot in (1, 2, 3):
+            assert f"tau_rb_alpha_{slot}_sum" in metrics
+            assert f"tau_rb_accept_{slot}_sum" in metrics
+            assert f"tau_rb_survival_{slot}_sum" in metrics
+        # slot 3 of the second block is invalid: it is counted once only
+        assert metrics["tau_rb_alpha_3_total"].item() == 1.0
+
+    def test_tau_rb_requires_token_ids(self):
+        logits, targets, _, loss_mask = self._make_inputs()
+        config = resolve_loss_config("tau_rb", "eager")
+        with pytest.raises(ValueError, match="token ids"):
+            _compute_metrics(
+                logits,
+                targets,
+                loss_mask,
+                self.block_size,
+                loss_config=config,
+            )
+
+    def test_tau_only_config(self):
+        logits, targets, token_ids, loss_mask = self._make_inputs()
+        config = resolve_loss_config("tau_rb", "eager")
+        loss, metrics = _compute_metrics(
+            logits,
+            targets,
+            loss_mask,
+            self.block_size,
+            loss_config=config,
+            token_ids=token_ids,
+            target_temperature=0.5,
+        )
+        tau_term, _ = tau_rb_block_loss(
+            logits, targets, token_ids, loss_mask, self.block_size,
+            temperature=0.5,
+        )
+        assert loss.item() == pytest.approx(tau_term.item(), abs=1e-5)
