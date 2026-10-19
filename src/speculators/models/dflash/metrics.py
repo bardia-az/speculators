@@ -12,6 +12,7 @@ from speculators.losses import (
     dpace_loss_decay,
     kl_div_loss,
 )
+from speculators.losses.tau_rb import tau_rb_block_loss
 from speculators.models.metrics import (
     compute_accepted_length_counts,
     compute_accuracy_multi_step,
@@ -30,6 +31,9 @@ def compute_metrics(
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = False,
+    token_ids: torch.Tensor | None = None,
+    target_temperature: float = 1.0,
+    t2d: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute loss and accuracy metrics for draft model predictions.
 
@@ -39,9 +43,16 @@ def compute_metrics(
         loss_mask: Binary mask [1, T]
         block_size: Block size for per-position metrics
         gamma: Temperature for exponential decay in loss weighting
-        loss_config: Mapping of ``{name: (loss_fn, weight)}``
+        loss_config: Mapping of ``{name: (loss_fn, weight)}``; a ``tau_rb``
+            entry is computed with block context instead of the per-position
+            dispatch
         per_position_loss_weight: Weighting option for per-position block-drafting loss
         dpace_alpha: Smoothing constant for D-Pace loss weighting
+        token_ids: Realized training tokens at each slot (verifier vocab),
+            required by the ``tau_rb`` loss
+        target_temperature: Temperature forming ``p`` for the ``tau_rb`` loss
+        t2d: Target-to-draft vocab mapping for the ``tau_rb`` loss, or None
+            when the draft uses the full vocabulary
 
     Returns:
         Tuple of (loss, metrics_dict) where metrics_dict contains:
@@ -50,12 +61,41 @@ def compute_metrics(
             - position {i} acc: Accuracy at position i within blocks
             - eal: Expected Accepted Length, the mean per-block accepted run
               plus the verifier's bonus token (headline metric)
+            - tau_rb_loss / tau_rb_tau_hat / per-slot tau_rb_alpha_{i},
+              tau_rb_accept_{i}, tau_rb_survival_{i}: estimator diagnostics
+              when the loss config contains ``tau_rb``
     """
     if loss_config is None:
         loss_config = _DEFAULT_LOSS_CONFIG
     seq_len = logits.shape[1]
     pos_idx = torch.arange(seq_len, device=logits.device) % block_size
     pos_idx = pos_idx.unsqueeze(0)  # shape: [1, T]
+
+    # tau_rb needs the realized tokens and block structure, so it is computed
+    # here rather than through the per-position (logits, targets) dispatch.
+    tau_term: torch.Tensor | None = None
+    tau_stats: dict[str, torch.Tensor] | None = None
+    per_position_config: LossConfig = {}
+    for name, spec in loss_config.items():
+        if name == "tau_rb":
+            if token_ids is None:
+                raise ValueError(
+                    "tau_rb requires the realized token ids aligned to the "
+                    "draft slots (token_ids); the DFlash forward passes them "
+                    "automatically."
+                )
+            tau_term, tau_stats = tau_rb_block_loss(
+                logits,
+                targets,
+                token_ids,
+                loss_mask,
+                block_size,
+                temperature=target_temperature,
+                t2d=t2d,
+                sample_from_anchor=sample_from_anchor,
+            )
+        else:
+            per_position_config[name] = spec
 
     if per_position_loss_weight == "dpace":
         decay_fn = partial(
@@ -74,9 +114,12 @@ def compute_metrics(
         targets,
         loss_mask,
         pos_idx,
-        loss_config=loss_config,
+        loss_config=per_position_config,
         decay_fn=decay_fn,
     )
+    if tau_term is not None:
+        _fn, weight = loss_config["tau_rb"]
+        loss = loss + weight * tau_term
 
     pred_ids = torch.argmax(logits, dim=-1)
     target_ids = torch.argmax(targets, dim=-1)
@@ -110,4 +153,24 @@ def compute_metrics(
     )
     metrics["eal_sum"] = eal_sum
     metrics["eal_total"] = eal_total
+
+    if tau_term is not None and tau_stats is not None:
+        block_valid = tau_stats["block_valid"]
+        metrics["tau_rb_loss_sum"] = tau_term.detach()
+        metrics["tau_rb_loss_total"] = ones.clone()
+        metrics["tau_rb_tau_hat_sum"] = tau_stats["tau_hat"][block_valid].sum()
+        metrics["tau_rb_tau_hat_total"] = block_valid.sum()
+        slot_valid = tau_stats["slot_valid"]
+        for k in range(slot_valid.shape[1]):
+            m = slot_valid[:, k]
+            slot = start_pos + k
+            alpha_k = tau_stats["alpha"][:, k][m]
+            accept_k = tau_stats["accept"][:, k][m]
+            survival_k = tau_stats["survival"][:, k][m]
+            metrics[f"tau_rb_alpha_{slot}_sum"] = alpha_k.sum()
+            metrics[f"tau_rb_accept_{slot}_sum"] = accept_k.sum()
+            metrics[f"tau_rb_survival_{slot}_sum"] = survival_k.sum()
+            metrics[f"tau_rb_alpha_{slot}_total"] = m.sum()
+            metrics[f"tau_rb_accept_{slot}_total"] = m.sum()
+            metrics[f"tau_rb_survival_{slot}_total"] = m.sum()
     return loss, metrics

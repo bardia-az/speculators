@@ -312,8 +312,21 @@ class LossArgs(_Group):
     loss_fn: str | None = Field(
         default=None,
         description="Loss function specification. A name (kl_div, rkl, jsd, ce, tv, "
-        'nla, lk_hybrid) or a JSON dict for a weighted combination, e.g. \'{"ce": 0.1, '
-        '"tv": 0.9}\'. (default: "ce" for dflash, "kl_div" otherwise).',
+        'nla, lk_hybrid, tau_rb) or a JSON dict for a weighted combination, e.g. '
+        '\'{"ce": 0.1, "tv": 0.9}\'. tau_rb is the exact accepted-length loss '
+        "(computed with block context; combine it with kl_div or start from a "
+        'pretrained checkpoint, since acceptance-type losses have weak gradients '
+        'when the drafter is far from the target). (default: "ce" for dflash, '
+        '"kl_div" otherwise).',
+    )
+    target_temperature: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="Temperature applied to the target logits when forming p for "
+        "the tau_rb loss. Must match the temperature the training data was "
+        "generated at: greedy (temperature-0) regenerated data corresponds to a "
+        "very small value, where tau_rb degenerates to the greedy chain loss. "
+        "Other losses are unaffected.",
     )
     ttt_steps: int = Field(
         default=3,

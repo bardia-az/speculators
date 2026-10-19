@@ -6,6 +6,7 @@ from collections.abc import Callable
 import torch
 
 from speculators.losses import eager
+from speculators.losses.tau_rb import tau_rb_loss
 
 _LOSS_REDUCTION_EPS = 1e-5
 
@@ -164,6 +165,9 @@ _FUSED_LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tenso
     "tv": tv_loss,
     "nla": neg_log_acceptance_loss,
     "lk_hybrid": lk_hybrid_loss,
+    # Block-level loss: resolved here so --loss-fn accepts the name, but
+    # computed with token ids and block context by compute_metrics().
+    "tau_rb": tau_rb_loss,
 }
 
 
@@ -175,6 +179,7 @@ _EAGER_LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tenso
     "tv": eager.tv_loss,
     "nla": eager.neg_log_acceptance_loss,
     "lk_hybrid": eager.lk_hybrid_loss,
+    "tau_rb": tau_rb_loss,
 }
 
 
