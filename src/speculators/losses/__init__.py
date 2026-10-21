@@ -1,6 +1,6 @@
 """Training loss implementations and shared utilities."""
 
-from speculators.losses.tau_rb import tau_rb_block_loss, tau_rb_loss
+from speculators.losses.tau_rb import tau_rb_block_loss, tau_rb_fused_loss, tau_rb_loss
 from speculators.losses.utils import (
     LossConfig,
     ce_loss,
@@ -33,6 +33,7 @@ __all__ = [
     "resolve_loss_config",
     "reverse_kl_div_loss",
     "tau_rb_block_loss",
+    "tau_rb_fused_loss",
     "tau_rb_loss",
     "tv_loss",
 ]

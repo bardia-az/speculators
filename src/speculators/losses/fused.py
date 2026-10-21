@@ -17,6 +17,13 @@ treated as constant), L the row loss:
     ce      dp - onehot(argmax tp)
     tv      -dp * (1[dp <= tp] - s_s),  s_s = sum of dp where dp <= tp
 
+A second, OP-less kernel pair (``tau_rb_stats_kernel``/``tau_rb_grad_kernel``)
+serves the block-level ``tau_rb`` loss the same way: forward emits the per-row
+statistics ``(alpha, logq_z, logp_z)`` the block math needs, and backward
+applies the closed-form gradient those statistics induce. The block logic
+itself (survival chain, tau_hat) is [num_blocks, K]-sized eager math in
+``losses.tau_rb``, never full-vocab.
+
 Derived from SpecForge specforge/core/loss.py (Apache-2.0, Unsloth/Liger
 lineage); TV gradient sign convention matches Liger ops/tvd.py.
 """
@@ -88,6 +95,12 @@ _OP_TV = tl.constexpr(4)
 # KL(dp||mix) | tv: s_s | ce: argmax as float32 (exact: vocab < 2**24).
 _N_STATS = 5
 
+# stats [_TAU_N_STATS, n_rows] for the tau_rb row statistics below: [0]/[1]
+# draft row max / sum-exp, [2]/[3] same for temperature-scaled targets, [4]
+# alpha = sum_v min(dp, tp), [5] S = sum_v dp * w_v (the min subgradient's
+# softmax-correction weight; see tau_rb_stats_kernel).
+_TAU_N_STATS = 6
+
 
 def _tile_configs():
     """Register-resident (BLOCK_SIZE, num_warps) candidates for the autotuner."""
@@ -128,6 +141,14 @@ def _prune_oversized_tiles(configs, nargs, **_):
 _autotune_tile = triton.autotune(
     configs=_tile_configs(),
     key=["n_cols", "OP"],
+    prune_configs_by={"early_config_prune": _prune_oversized_tiles},
+)
+
+# The tau_rb kernels carry no OP selector (one reduction each), so their key
+# is the vocab alone.
+_autotune_tau_tile = triton.autotune(
+    configs=_tile_configs(),
+    key=["n_cols"],
     prune_configs_by={"early_config_prune": _prune_oversized_tiles},
 )
 
@@ -304,6 +325,159 @@ def loss_backward_kernel(
         tl.store(grad_in_ptr + offsets, go * grad, mask=mask)
 
 
+@triton.jit
+def _online_stats_scaled(row_ptr, n_cols, temperature, BLOCK_SIZE: tl.constexpr):
+    """Online max (m) and sum-exp (d) over one row of ``y / temperature``.
+
+    A sibling of ``_online_stats`` kept separate so the shared helper (and the
+    losses already validated on it) never pays for the division. The
+    temperature is cast to fp32 up front: under torch.compile, Inductor passes
+    Python floats as fp64, and an fp64 divisor would promote the loop-carried
+    accumulators out of fp32.
+    """
+    temp = temperature.to(tl.float32)
+    m = float("-inf")
+    d = 0.0
+    for i in range(0, n_cols, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        y = tl.load(row_ptr + offsets, mask=mask, other=float("-inf")).cast(tl.float32)
+        y = y / temp
+        block_max = tl.max(tl.where(mask, y, float("-inf")))
+        m_new = tl.maximum(m, block_max)
+        d = d * tl.exp(m - m_new) + tl.sum(tl.where(mask, tl.exp(y - m_new), 0.0))
+        m = m_new
+    return m, d
+
+
+# min(p, q) routes its subgradient to q where q < p and splits it evenly at
+# exact ties -- torch.minimum's autograd rule (0.5 to each operand), which the
+# block loss's eager reference inherits. The backward needs that weight, so the
+# forward stores S = sum_v dp * w_v alongside alpha:
+#
+#     w_v            = 1[dp_v < tp_v] + 0.5 * 1[dp_v == tp_v]
+#     d alpha/dx_v   = dp_v * (w_v - S)              (softmax correction)
+#     d logq_z/dx_v  = (v == z) - dp_v               (gather + correction)
+_TAU_TIE_WEIGHT = tl.constexpr(0.5)
+
+
+@_autotune_tau_tile
+@triton.jit
+def tau_rb_stats_kernel(
+    logits_ptr,
+    targets_ptr,
+    z_ptr,
+    alpha_ptr,
+    logq_z_ptr,
+    logp_z_ptr,
+    stats_ptr,
+    stats_row,
+    n_cols,
+    temperature,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """One row per program: tau_rb row statistics for the block loss.
+
+    Two passes per row: ``min(dp, tp)`` has no shared max-shift that keeps both
+    operands normalized, so pass 1 finishes the online-softmax normalizers and
+    pass 2 reduces on probabilities normalized by them. Pass 2 also gathers the
+    realized token's draft and target logits. Masked tail lanes hold 0.0 and
+    never enter an accumulator.
+    """
+    pid = tl.program_id(0).to(tl.int64)
+    logits_ptr += pid * n_cols
+    targets_ptr += pid * n_cols
+    temp = temperature.to(tl.float32)
+
+    m_d, z_d = _online_stats(logits_ptr, n_cols, BLOCK_SIZE)
+    lse_d = m_d + tl.log(z_d)
+    m_t, z_t = _online_stats_scaled(targets_ptr, n_cols, temp, BLOCK_SIZE)
+    lse_t = m_t + tl.log(z_t)
+
+    alpha = 0.0
+    extra = 0.0
+    for i in range(0, n_cols, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        x = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
+        y = tl.load(targets_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
+        dp = tl.exp(x - lse_d)
+        tp = tl.exp(y / temp - lse_t)
+        alpha += tl.sum(tl.where(mask, tl.minimum(dp, tp), 0.0))
+        w = tl.where(dp < tp, 1.0, tl.where(dp == tp, _TAU_TIE_WEIGHT, 0.0))
+        extra += tl.sum(tl.where(mask, dp * w, 0.0))
+
+    z = tl.load(z_ptr + pid)
+    x_z = tl.load(logits_ptr + z).cast(tl.float32)
+    y_z = tl.load(targets_ptr + z).cast(tl.float32)
+    tl.store(alpha_ptr + pid, alpha)
+    tl.store(logq_z_ptr + pid, x_z - lse_d)
+    tl.store(logp_z_ptr + pid, y_z / temp - lse_t)
+    tl.store(stats_ptr + 0 * stats_row + pid, m_d)
+    tl.store(stats_ptr + 1 * stats_row + pid, z_d)
+    tl.store(stats_ptr + 2 * stats_row + pid, m_t)
+    tl.store(stats_ptr + 3 * stats_row + pid, z_t)
+    tl.store(stats_ptr + 4 * stats_row + pid, alpha)
+    tl.store(stats_ptr + 5 * stats_row + pid, extra)
+
+
+@_autotune_tau_tile
+@triton.jit
+def tau_rb_grad_kernel(
+    logits_ptr,
+    targets_ptr,
+    grad_alpha_ptr,
+    grad_qz_ptr,
+    grad_in_ptr,
+    stats_ptr,
+    stats_row,
+    z_ptr,
+    n_cols,
+    temperature,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Recompute probabilities from the saved stats and apply the tau_rb gradient.
+
+    Both row-gradient scalars (through alpha and through the gathered logq_z)
+    arrive from the eager block math; rows where both are zero take the
+    early-out and return exact zeros from an uninitialized buffer.
+    """
+    pid = tl.program_id(0).to(tl.int64)
+    logits_ptr += pid * n_cols
+    targets_ptr += pid * n_cols
+    grad_in_ptr += pid * n_cols
+    temp = temperature.to(tl.float32)
+
+    go_a = tl.load(grad_alpha_ptr + pid)
+    go_z = tl.load(grad_qz_ptr + pid)
+    if go_a == 0.0 and go_z == 0.0:
+        for i in range(0, n_cols, BLOCK_SIZE):
+            offsets = i + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < n_cols
+            tl.store(grad_in_ptr + offsets, 0.0, mask=mask)
+        return
+
+    m_d = tl.load(stats_ptr + 0 * stats_row + pid)
+    z_d = tl.load(stats_ptr + 1 * stats_row + pid)
+    lse_d = m_d + tl.log(z_d)
+    m_t = tl.load(stats_ptr + 2 * stats_row + pid)
+    z_t = tl.load(stats_ptr + 3 * stats_row + pid)
+    lse_t = m_t + tl.log(z_t)
+    extra = tl.load(stats_ptr + 5 * stats_row + pid)
+    z = tl.load(z_ptr + pid).to(tl.int32)
+
+    for i in range(0, n_cols, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        x = tl.load(logits_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
+        y = tl.load(targets_ptr + offsets, mask=mask, other=0.0).cast(tl.float32)
+        dp = tl.exp(x - lse_d)
+        tp = tl.exp(y / temp - lse_t)
+        w = tl.where(dp < tp, 1.0, tl.where(dp == tp, _TAU_TIE_WEIGHT, 0.0))
+        grad = go_a * dp * (w - extra) + go_z * ((offsets == z).to(tl.float32) - dp)
+        tl.store(grad_in_ptr + offsets, grad, mask=mask)
+
+
 class _FusedLoss(torch.autograd.Function):
     """Shared autograd wrapper; ``op`` selects the loss reduction.
 
@@ -394,3 +568,87 @@ def fused_lk_hybrid_loss(logits, targets, eta: float = 3.0):
     tv = fused_tv_loss(logits, targets)
     weight = torch.exp(-eta * (1.0 - tv).detach())
     return weight * kl + (1.0 - weight) * tv
+
+
+class _TauRbRowStats(torch.autograd.Function):
+    """Autograd wrapper for the tau_rb per-row statistics.
+
+    Like ``_FusedLoss``, targets intentionally receive no gradient; use the
+    eager implementation when target gradients are required. ``logp_z`` is a
+    constant of the logits and marked non-differentiable; the caller's block
+    math consumes it without tracking.
+    """
+
+    @staticmethod
+    def forward(ctx, logits_flat, targets_flat, z_idx, temperature):
+        n_rows, vocab_size = logits_flat.shape
+        device = logits_flat.device
+        alpha = torch.empty(n_rows, device=device, dtype=torch.float32)
+        logq_z = torch.empty_like(alpha)
+        logp_z = torch.empty_like(alpha)
+        stats = torch.empty(_TAU_N_STATS, n_rows, device=device, dtype=torch.float32)
+        tau_rb_stats_kernel[(n_rows,)](
+            logits_flat,
+            targets_flat,
+            z_idx,
+            alpha,
+            logq_z,
+            logp_z,
+            stats,
+            stats.stride(0),
+            vocab_size,
+            temperature,
+        )
+        ctx.save_for_backward(logits_flat, targets_flat, stats, z_idx)
+        ctx.temperature = temperature
+        ctx.mark_non_differentiable(logp_z)
+        return alpha, logq_z, logp_z
+
+    @staticmethod
+    def backward(ctx, grad_alpha, grad_logq_z, _grad_logp_z):
+        logits_flat, targets_flat, stats, z_idx = ctx.saved_tensors
+        if grad_alpha is None and grad_logq_z is None:
+            return None, None, None, None
+        n_rows, vocab_size = logits_flat.shape
+        device = logits_flat.device
+        if grad_alpha is None:
+            grad_alpha = torch.zeros(n_rows, device=device, dtype=torch.float32)
+        if grad_logq_z is None:
+            grad_logq_z = torch.zeros(n_rows, device=device, dtype=torch.float32)
+        grad_in = torch.empty_like(logits_flat)
+        tau_rb_grad_kernel[(n_rows,)](
+            logits_flat,
+            targets_flat,
+            grad_alpha.contiguous(),
+            grad_logq_z.contiguous(),
+            grad_in,
+            stats,
+            stats.stride(0),
+            z_idx,
+            vocab_size,
+            ctx.temperature,
+        )
+        return grad_in, None, None, None
+
+
+def fused_tau_rb_row_stats(logits, targets, z_idx, temperature):
+    """Per-row ``(alpha, logq_z, logp_z)`` statistics for the tau_rb block loss.
+
+    Args:
+        logits: Drafter logits ``[rows, vocab]`` (any float dtype; cast to
+            fp32 on load like the other fused losses).
+        targets: Verifier-head logits ``[rows, vocab]``, divided by
+            ``temperature`` in-kernel (no full-width copy is materialized).
+        z_idx: One draft-vocab index per row (int64); entries for tokens
+            outside the draft vocab are valid indices whose gathered values
+            the caller overwrites.
+        temperature: Target temperature forming ``p`` (must be > 0).
+
+    Returns:
+        Tuple of fp32 ``[rows]`` tensors: ``alpha`` (per-row exact acceptance
+        ``sum_v min(p, q)``), ``logq_z``/``logp_z`` (log-probabilities of the
+        realized token under draft and target). Gradients flow into
+        ``logits`` through ``alpha`` and ``logq_z``; ``targets`` receives
+        none.
+    """
+    return _TauRbRowStats.apply(logits, targets, z_idx, temperature)

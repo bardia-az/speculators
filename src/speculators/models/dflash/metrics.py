@@ -12,7 +12,7 @@ from speculators.losses import (
     dpace_loss_decay,
     kl_div_loss,
 )
-from speculators.losses.tau_rb import tau_rb_block_loss
+from speculators.losses.tau_rb import tau_rb_block_loss, tau_rb_fused_loss
 from speculators.models.metrics import (
     compute_accepted_length_counts,
     compute_accuracy_multi_step,
@@ -52,6 +52,51 @@ def _select_decay_fn(
     )
 
 
+def _tau_rb_term(
+    loss_config: LossConfig,
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    loss_mask: torch.Tensor,
+    block_size: int,
+    *,
+    sample_from_anchor: bool,
+    token_ids: torch.Tensor | None,
+    target_temperature: float,
+    t2d: torch.Tensor | None,
+    loss_implementation: str,
+) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None]:
+    """Compute the block-level tau_rb term when the config selects it.
+
+    tau_rb needs the realized tokens and block structure, so it bypasses the
+    per-position ``(logits, targets)`` dispatch entirely: this helper is the
+    single place the block loss enters compute_metrics, picking the fused
+    Triton routine or the eager reference per the chosen implementation.
+    """
+    if "tau_rb" not in loss_config:
+        return None, None
+    if loss_implementation not in ("fused", "eager"):
+        raise ValueError(
+            f"Unknown loss implementation '{loss_implementation}'. Choose "
+            "from: ['eager', 'fused']"
+        )
+    if token_ids is None:
+        raise ValueError(
+            "tau_rb requires the realized token ids aligned to the draft "
+            "slots (token_ids); the DFlash forward passes them automatically."
+        )
+    tau_fn = tau_rb_fused_loss if loss_implementation == "fused" else tau_rb_block_loss
+    return tau_fn(
+        logits,
+        targets,
+        token_ids,
+        loss_mask,
+        block_size,
+        temperature=target_temperature,
+        t2d=t2d,
+        sample_from_anchor=sample_from_anchor,
+    )
+
+
 def compute_metrics(
     logits: torch.Tensor,  # shape: [1, num_anchors*block_size, draft_vocab_size]
     targets: torch.Tensor,  # shape: [1, num_anchors*block_size, draft_vocab_size]
@@ -66,6 +111,7 @@ def compute_metrics(
     token_ids: torch.Tensor | None = None,
     target_temperature: float = 1.0,
     t2d: torch.Tensor | None = None,
+    loss_implementation: str = "fused",
 ) -> tuple[torch.Tensor, dict]:
     """Compute loss and accuracy metrics for draft model predictions.
 
@@ -85,6 +131,10 @@ def compute_metrics(
         target_temperature: Temperature forming ``p`` for the ``tau_rb`` loss
         t2d: Target-to-draft vocab mapping for the ``tau_rb`` loss, or None
             when the draft uses the full vocabulary
+        loss_implementation: Which ``tau_rb`` block routine computes the
+            intercept -- the fused Triton path ("fused", the default, which
+            also matches the per-position losses' resolution default) or the
+            eager reference ("eager")
 
     Returns:
         Tuple of (loss, metrics_dict) where metrics_dict contains:
@@ -105,29 +155,21 @@ def compute_metrics(
 
     # tau_rb needs the realized tokens and block structure, so it is computed
     # here rather than through the per-position (logits, targets) dispatch.
-    tau_term: torch.Tensor | None = None
-    tau_stats: dict[str, torch.Tensor] | None = None
-    per_position_config: LossConfig = {}
-    for name, spec in loss_config.items():
-        if name == "tau_rb":
-            if token_ids is None:
-                raise ValueError(
-                    "tau_rb requires the realized token ids aligned to the "
-                    "draft slots (token_ids); the DFlash forward passes them "
-                    "automatically."
-                )
-            tau_term, tau_stats = tau_rb_block_loss(
-                logits,
-                targets,
-                token_ids,
-                loss_mask,
-                block_size,
-                temperature=target_temperature,
-                t2d=t2d,
-                sample_from_anchor=sample_from_anchor,
-            )
-        else:
-            per_position_config[name] = spec
+    tau_term, tau_stats = _tau_rb_term(
+        loss_config,
+        logits,
+        targets,
+        loss_mask,
+        block_size,
+        sample_from_anchor=sample_from_anchor,
+        token_ids=token_ids,
+        target_temperature=target_temperature,
+        t2d=t2d,
+        loss_implementation=loss_implementation,
+    )
+    per_position_config = {
+        name: spec for name, spec in loss_config.items() if name != "tau_rb"
+    }
 
     decay_fn = _select_decay_fn(
         per_position_loss_weight,

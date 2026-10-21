@@ -301,6 +301,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
             "target_temperature": kwargs.get("target_temperature", 1.0),
+            "loss_implementation": kwargs.get("loss_implementation", "fused"),
         }
         return dict(shared), dict(shared)
 
@@ -498,6 +499,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
         target_temperature: float = 1.0,
+        loss_implementation: str = "fused",
         **kwargs,
     ):
         _, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -525,5 +527,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             token_ids=input_ids[:, anchored_block_indices],
             target_temperature=target_temperature,
             t2d=getattr(self, "t2d", None),
+            loss_implementation=loss_implementation,
         )
         return None, loss, metrics
