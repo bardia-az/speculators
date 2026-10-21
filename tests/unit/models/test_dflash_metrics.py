@@ -15,10 +15,23 @@ from speculators.losses.eager import ce_loss
 from speculators.losses.tau_rb import tau_rb_block_loss
 from speculators.models.dflash.metrics import compute_metrics as _compute_metrics
 from speculators.models.metrics import compute_accuracy_multi_step
+from speculators.utils.util import is_npu_available
 
 compute_metrics = partial(
     _compute_metrics, loss_config=resolve_loss_config("kl_div", "eager")
 )
+
+
+def _accelerator_device() -> str | None:
+    """Pick the accelerator the fused tau_rb path can run on, or None."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if is_npu_available():
+        return "npu"
+    return None
+
+
+DEVICE = _accelerator_device()
 
 
 def _ids_to_logits(ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
@@ -408,7 +421,7 @@ class TestTauRbIntegration:
 
     block_size = 4
 
-    def _make_inputs(self, seed=7):
+    def _make_inputs(self, seed=7, implementation="eager"):
         gen = torch.Generator().manual_seed(seed)
         vocab = 6
         seq = 2 * self.block_size
@@ -417,6 +430,9 @@ class TestTauRbIntegration:
         token_ids = torch.randint(0, vocab, (1, seq), generator=gen)
         # second block truncated at its last slot
         loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0]])
+        if implementation == "fused":
+            logits, targets = logits.to(DEVICE), targets.to(DEVICE)
+            token_ids, loss_mask = token_ids.to(DEVICE), loss_mask.to(DEVICE)
         return logits, targets, token_ids, loss_mask
 
     def test_registry_accepts_tau_rb(self):
@@ -426,8 +442,27 @@ class TestTauRbIntegration:
         mixed = resolve_loss_config('{"kl_div": 0.1, "tau_rb": 0.9}', "eager")
         assert set(mixed) == {"kl_div", "tau_rb"}
 
-    def test_mixed_config_combines_terms(self):
+    def test_unknown_implementation_rejected(self):
         logits, targets, token_ids, loss_mask = self._make_inputs()
+        config = resolve_loss_config("tau_rb", "eager")
+        with pytest.raises(ValueError, match="implementation"):
+            _compute_metrics(
+                logits,
+                targets,
+                loss_mask,
+                self.block_size,
+                loss_config=config,
+                token_ids=token_ids,
+                loss_implementation="triton",
+            )
+
+    @pytest.mark.parametrize(
+        "implementation", ["eager"] + (["fused"] if DEVICE else [])
+    )
+    def test_mixed_config_combines_terms(self, implementation):
+        logits, targets, token_ids, loss_mask = self._make_inputs(
+            implementation=implementation
+        )
         config = resolve_loss_config('{"kl_div": 0.1, "tau_rb": 0.9}', "eager")
         loss, metrics = _compute_metrics(
             logits,
@@ -436,9 +471,10 @@ class TestTauRbIntegration:
             self.block_size,
             loss_config=config,
             token_ids=token_ids,
+            loss_implementation=implementation,
         )
 
-        pos_idx = torch.arange(8).unsqueeze(0) % self.block_size
+        pos_idx = torch.arange(8, device=logits.device).unsqueeze(0) % self.block_size
         kl_term = loss_function(
             logits,
             targets,
@@ -472,6 +508,7 @@ class TestTauRbIntegration:
                 loss_mask,
                 self.block_size,
                 loss_config=config,
+                loss_implementation="eager",
             )
 
     def test_tau_only_config(self):
@@ -485,6 +522,7 @@ class TestTauRbIntegration:
             loss_config=config,
             token_ids=token_ids,
             target_temperature=0.5,
+            loss_implementation="eager",
         )
         tau_term, _ = tau_rb_block_loss(
             logits,
@@ -510,6 +548,7 @@ class TestTauRbIntegration:
             loss_config=config,
             token_ids=token_ids,
             per_position_loss_weight="none",
+            loss_implementation="eager",
         )
 
         pos_idx = torch.arange(8).unsqueeze(0) % self.block_size
