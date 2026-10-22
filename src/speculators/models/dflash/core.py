@@ -237,7 +237,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         block_size = kwargs.get("block_size", 8)
 
-        default_sample_from_anchor = algorithm == "dspark"
+        default_sample_from_anchor = algorithm in {"dspark", "dflex"}
         sample_from_anchor_arg = kwargs.get("sample_from_anchor")
         sample_from_anchor = (
             default_sample_from_anchor
@@ -373,6 +373,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
+    def _loss_mask_gather_indices(
+        self, anchored_block_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Sequence positions whose loss_mask entry applies to each block slot.
+
+        DFlash (and DSpark, which shares this default) gathers the block
+        positions themselves: slot ``k`` predicts the token at ``a + k``, so
+        its label validity is ``loss_mask[a + k]``. dflex overrides this with
+        the label positions one step further (slot ``i`` predicts the token
+        at ``a + i + 1``).
+        """
+        return anchored_block_indices
+
     def _backbone_forward(
         self,
         hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
@@ -468,7 +481,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         logits = self.lm_head(hidden)
         # shape: [1, num_anchors*block_size, vocab_size]
 
-        aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
+        aligned_loss_mask = loss_mask.clone()[
+            :, self._loss_mask_gather_indices(anchored_block_indices)
+        ]
         # shape: [1, num_anchors*block_size]
 
         # zero out any padded anchor blocks

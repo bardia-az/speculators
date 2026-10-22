@@ -480,7 +480,8 @@ class DFlashArgs(_Group):
     sample_from_anchor: bool | None = Field(
         default=None,
         description="Sample from the anchor position (all positions predict). "
-        "Default: False for dflash/dflash2, True for dspark.",
+        "Default: False for dflash/dflash2, True for dspark; dflex pins it "
+        "to True (it is dflex's defining indexing).",
     )
     dflash_decay_gamma: float = Field(
         default=4.0, description="Decay gamma for DFlash-family loss weighting."
@@ -671,7 +672,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dflash2, dspark, peagle, mtp).",
+        "(eagle3, dflash, dflash2, dspark, dflex, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -723,6 +724,10 @@ class TrainConfig(BaseSettings):
         combination was never tested there. DFlash2 shares the ``dflash`` group
         and uses five layers, while keeping ``block_size=8``, fixed exponential
         position weights, and KL loss for direct comparison with DSpark.
+        dflex (DFlash with anchor-inclusive next-token indexing) mirrors the
+        dflash recipe defaults exactly, so the two compare at matched settings;
+        note the block-size semantics differ: a dflex block of ``B`` positions
+        drafts ``B`` tokens, a DFlash block drafts ``B - 1``.
         ``--muon-lr`` / ``--lr`` are
         deliberately left as-is: the right learning rate depends on effective
         batch size (anchor count, sequence length, GPU count), which varies by
@@ -732,8 +737,13 @@ class TrainConfig(BaseSettings):
         untouched, so :meth:`from_flat` round-trips.
         """
         is_eagle3 = self.speculator_type == "eagle3"
-        is_dflash = self.speculator_type == "dflash"
-        is_dflash_family = self.speculator_type in {"dflash", "dspark", "dflash2"}
+        is_dflash = self.speculator_type in {"dflash", "dflex"}
+        is_dflash_family = self.speculator_type in {
+            "dflash",
+            "dspark",
+            "dflash2",
+            "dflex",
+        }
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
         if self.draft.norm_before_fc is None:
