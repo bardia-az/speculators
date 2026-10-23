@@ -383,6 +383,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         its label validity is ``loss_mask[a + k]``. dflex overrides this with
         the label positions one step further (slot ``i`` predicts the token
         at ``a + i + 1``).
+
+        This is the single definition of per-slot label alignment: besides
+        the loss mask it also gathers tau_rb's realized per-slot token ids
+        (the tokens the draft proposes and that get accepted/rejected).
         """
         return anchored_block_indices
 
@@ -539,7 +543,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
-            token_ids=input_ids[:, anchored_block_indices],
+            # realized tokens at each slot's LABEL position (same alignment
+            # hook as the loss mask): dflash/dspark gather the block
+            # positions themselves, dflex the positions one step further
+            token_ids=input_ids[
+                :, self._loss_mask_gather_indices(anchored_block_indices)
+            ],
             target_temperature=target_temperature,
             t2d=getattr(self, "t2d", None),
             loss_implementation=loss_implementation,

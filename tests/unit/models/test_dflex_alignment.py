@@ -248,7 +248,13 @@ class TestTargetAlignment:
     """The verifier distribution consumed by every loss is one-hot on the
     dflex slot's label."""
 
-    @pytest.mark.parametrize("loss_name", sorted(_EAGER_LOSS_FN_MAP))
+    # tau_rb is excluded: its registry entry is a deliberate stub for the
+    # per-position dispatch (a block-level loss, computed inside
+    # compute_metrics from the realized token ids) — it gets the dedicated
+    # test right below instead of this sweep.
+    @pytest.mark.parametrize(
+        "loss_name", [n for n in sorted(_EAGER_LOSS_FN_MAP) if n != "tau_rb"]
+    )
     def test_every_eager_loss_sees_aligned_targets(self, loss_name):
         model = _tiny_dflex()
         loss_mask = _mask_from(range(1, 12))
@@ -276,6 +282,58 @@ class TestTargetAlignment:
         assert torch.all(
             loss_fn(misaligned, aligned) >= loss_fn(aligned, aligned) + 0.1
         )
+
+    def test_tau_rb_sees_next_token_realized_ids(self, monkeypatch):
+        """tau_rb is block-level: the per-position registry entry is a stub
+        that raises by design, and the block path receives, at every dflex
+        slot, the realized token at that slot's LABEL position — slot i's
+        ``a + i + 1``, the token a dflex draft actually proposes there (and
+        that gets accepted/rejected by the verifier)."""
+        import speculators.models.dflash.metrics as dflash_metrics
+
+        captured = {}
+        real_tau = dflash_metrics.tau_rb_block_loss
+
+        def spy(logits, targets, token_ids, *args, **kwargs):
+            captured["token_ids"] = token_ids
+            return real_tau(logits, targets, token_ids, *args, **kwargs)
+
+        monkeypatch.setattr(dflash_metrics, "tau_rb_block_loss", spy)
+
+        model = _tiny_dflex()
+        loss_mask = _mask_from(range(1, 12))
+        batch = _toy_batch(loss_mask)  # seeds the RNG; anchors reproduce below
+        loss_config = {
+            "kl_div": (_EAGER_LOSS_FN_MAP["kl_div"], 1.0),
+            "tau_rb": (_EAGER_LOSS_FN_MAP["tau_rb"], 1.0),
+        }
+        _, loss, metrics = model.forward(
+            *batch,
+            loss_config=loss_config,
+            max_anchors=4,
+            per_position_loss_weight="none",
+            loss_implementation="eager",
+        )
+
+        # the stub documents the block-level design
+        with pytest.raises(RuntimeError, match="block-level"):
+            _EAGER_LOSS_FN_MAP["tau_rb"](
+                torch.zeros(1, BLOCK, VOCAB), torch.zeros(1, BLOCK, VOCAB)
+            )
+
+        # the block path got the realized ids one past each block position
+        # (same seeded batch -> the same sampled anchors)
+        anchors, _, _ = _run_blocks(model, loss_mask)
+        ids = _toy_ids()[0]
+        got = captured["token_ids"][0].reshape(-1, BLOCK)
+        assert got.shape == anchors.shape
+        for row, a in zip(got, anchors[:, 0]):
+            assert row.tolist() == ids[a + 1 : a + BLOCK + 1].tolist()
+
+        assert torch.isfinite(loss)
+        assert "tau_rb_loss_sum" in metrics
+        assert "tau_rb_tau_hat_sum" in metrics
+        assert metrics["tau_rb_loss_total"].item() > 0
 
     def test_dflex_full_forward_metrics(self):
         """forward() wiring: slot 0 is a real prediction and all per-position
