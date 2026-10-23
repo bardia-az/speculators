@@ -492,6 +492,15 @@ def build_draft_model(
             # __init__ resolves its own default ("sdpa") when it is absent.
             config = model_class.config_class.from_pretrained(args.from_pretrained)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl  # noqa: SLF001
+            # Same re-application for the causality hint: the flag is tri-state
+            # (None = unspecified), and finetuned-from-release checkpoints either
+            # lack the field or reload it as the pydantic default (False), which
+            # vLLM's updater then reads as "serve causal" even for
+            # all-full-attention (bidirectionally trained) drafters.
+            if args.sliding_window_non_causal is not None and hasattr(
+                config, "sliding_window_non_causal"
+            ):
+                config.sliding_window_non_causal = args.sliding_window_non_causal
             return model_class.from_pretrained(
                 args.from_pretrained,
                 config=config,
