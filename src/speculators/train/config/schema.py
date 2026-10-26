@@ -500,6 +500,17 @@ class DFlashArgs(_Group):
         description="Smoothing constant for the D-PACE loss (default: 0.5). Must be in "
         "(0, 1] when --per-position-loss-weight=dpace.",
     )
+    attention_mode: Literal["bidirectional", "causal", "hybrid"] | None = Field(
+        default=None,
+        description="In-block draft attention visibility (dflex only): "
+        "'bidirectional' (default) -- every block position attends to every "
+        "position in its block; 'causal' -- block position i attends to j <= "
+        "i; 'hybrid' -- real tokens attend only to real tokens at j <= i, "
+        "masks attend to the whole block. Overrides "
+        "sliding_window_non_causal on every layer type. Saved to the "
+        "checkpoint and read back at inference -- it is never a serving-side "
+        "flag (vLLM serving of hybrid checkpoints is refused).",
+    )
 
 
 class DFlash2Args(_Group):
@@ -788,6 +799,19 @@ class TrainConfig(BaseSettings):
             raise ValueError(
                 "--per-position-loss-weight=none is only implemented for "
                 "--speculator-type=dflash"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_attention_mode(self) -> "TrainConfig":
+        """``--attention-mode`` is dflex-only: DFlash/DSpark/DFlash2 keep the
+        legacy ``sliding_window_non_causal`` in-block rule (their configs do
+        not even declare the field, so a set value could only be silently
+        dropped)."""
+        if self.dflash.attention_mode is not None and self.speculator_type != "dflex":
+            raise ValueError(
+                "--attention-mode is only implemented for "
+                "--speculator-type=dflex"
             )
         return self
 

@@ -54,6 +54,37 @@ class DFlexDraftModel(DFlashDraftModel):
         """
         return anchored_block_indices + 1
 
+    @staticmethod
+    def _apply_serving_causal_hint(config: DFlexSpeculatorConfig) -> None:
+        """Stamp the draft transformer config with vLLM's serving causality.
+
+        vLLM resolves per-layer draft causality from
+        ``transformer_layer_config.is_causal`` first (``_dflash_layer_causal``
+        in its qwen3_dflash runtime), so stamping it at training time makes
+        serving follow the training mode: ``bidirectional`` -> ``False``,
+        ``causal`` -> ``True``. ``hybrid`` -- a per-(query, key) in-block
+        pattern -- cannot ride a single boolean, so it is deliberately left
+        unstamped and warned about: hybrid checkpoints are refused by the
+        repo's serving script and evaluated by the offline crosscheck.
+        """
+        mode = config.attention_mode
+        if mode == "hybrid":
+            logger.warning(
+                "dflex attention_mode='hybrid' cannot be served by vLLM: its "
+                "Attention interface takes a single causal flag, not a "
+                "per-(query, key) in-block pattern. The serving-causality "
+                "hint is left unstamped; scripts/serve_dflash.sh refuses "
+                "hybrid checkpoints and scripts/acceptance_crosscheck.py "
+                "evaluates them offline."
+            )
+            tl_config = config.transformer_layer_config
+            if "is_causal" in tl_config.__dict__:  # noqa: SLF001
+                # Never inherit a stale hint on an explicit hybrid (e.g. a
+                # finetune run re-selecting the mode via the CLI).
+                del tl_config.__dict__["is_causal"]  # noqa: SLF001
+            return
+        config.transformer_layer_config.is_causal = mode == "causal"
+
     @classmethod
     def from_training_args(
         cls,
@@ -73,6 +104,7 @@ class DFlexDraftModel(DFlashDraftModel):
         config = DFlexSpeculatorConfig(
             **cls._build_base_config_kwargs("dflex", verifier_config, **kwargs)
         )
+        cls._apply_serving_causal_hint(config)
         model = cls(config=config)
         model.load_vocab_mappings(t2d, d2t)
         model.load_verifier_weights()

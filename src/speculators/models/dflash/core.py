@@ -108,6 +108,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.uses_sliding_window_attn = bool(self.sliding_window_indices)
         self.uses_full_attn = bool(num_draft_layers - len(self.sliding_window_indices))
         self.sliding_window_non_causal = config.sliding_window_non_causal
+        # dflex in-block attention mode. None (DFlash/DSpark/DFlash2, whose
+        # configs never declare the field) keeps the legacy
+        # sliding_window_non_causal rule verbatim; a set mode overrides it on
+        # every layer type.
+        self.attention_mode = getattr(config, "attention_mode", None)
 
         self.norm = Qwen3RMSNorm(
             config.transformer_layer_config.hidden_size,
@@ -250,12 +255,28 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             default_non_causal if non_causal_arg is None else non_causal_arg
         )
 
+        # dflex: in-block visibility is governed by attention_mode (default
+        # bidirectional), overriding the legacy sliding_window_non_causal
+        # rule on every layer type. Only dflex declares the config field, so
+        # the key is passed for dflex configs alone -- DFlash/DSpark/DFlash2
+        # kwargs are unchanged.
+        attention_mode = kwargs.get("attention_mode")
+        if algorithm == "dflex":
+            attention_mode = (
+                "bidirectional" if attention_mode is None else attention_mode
+            )
+        elif attention_mode is not None:
+            raise ValueError(
+                f"attention_mode is dflex-only (got {attention_mode!r} for "
+                f"{algorithm}); the CLI should have rejected this earlier."
+            )
+
         # Calculate speculative tokens based on sample_from_anchor
         # False: anchor is bonus token (block_size - 1 tokens)
         # True: sample from anchor too (block_size tokens)
         speculative_tokens = block_size if sample_from_anchor else block_size - 1
 
-        return {
+        base_config_kwargs = {
             "transformer_layer_config": verifier_config,
             "draft_vocab_size": kwargs["draft_vocab_size"],
             "block_size": block_size,
@@ -274,6 +295,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 ),
             ),
         }
+        if algorithm == "dflex":
+            base_config_kwargs["attention_mode"] = attention_mode
+        return base_config_kwargs
 
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
@@ -332,6 +356,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             block_size=self.block_size,
             sliding_window=sliding_window,
             sliding_window_non_causal=sliding_window_non_causal,
+            attention_mode=self.attention_mode,
         )
         return self._create_mask_fn(
             mask_mod,

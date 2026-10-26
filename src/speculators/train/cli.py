@@ -501,6 +501,19 @@ def build_draft_model(
                 config, "sliding_window_non_causal"
             ):
                 config.sliding_window_non_causal = args.sliding_window_non_causal
+            # Same re-application for dflex's in-block attention mode: the
+            # flag is tri-state (None = keep the checkpoint's mode), and an
+            # explicit choice re-derives the serving-causality hint the same
+            # way from_training_args does at scratch-construction time.
+            if getattr(args, "attention_mode", None) is not None and hasattr(
+                config, "attention_mode"
+            ):
+                config.attention_mode = args.attention_mode
+                reapply_hint = getattr(
+                    model_class, "_apply_serving_causal_hint", None
+                )
+                if reapply_hint is not None:
+                    reapply_hint(config)
             return model_class.from_pretrained(
                 args.from_pretrained,
                 config=config,

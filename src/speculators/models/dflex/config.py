@@ -33,6 +33,23 @@ class DFlexSpeculatorConfig(DFlashSpeculatorConfig):
         default_factory=lambda: ["DFlexSpeculator"],
         description="Model architectures that can load these weights",
     )
+    attention_mode: Literal["bidirectional", "causal", "hybrid"] = Field(
+        default="bidirectional",
+        description=(
+            "In-block draft attention visibility: 'bidirectional' (default; "
+            "every block position attends to every position in its block), "
+            "'causal' (block position i attends to block positions j <= i), "
+            "or 'hybrid' (real tokens attend only to real tokens at j <= i; "
+            "masks attend to the whole block). Context visibility strictly "
+            "before the anchor is unchanged in every mode. For dflex this "
+            "overrides the legacy sliding_window_non_causal rule on every "
+            "layer type. Saved with the checkpoint; inference (fork forward "
+            "and the offline crosscheck) reads it from here, never from a "
+            "flag. vLLM serving: bidirectional/causal map to the "
+            "transformer_layer_config.is_causal hint stamped at training "
+            "time; hybrid has no serving representation."
+        ),
+    )
     sample_from_anchor: bool = Field(
         default=True,
         description=(
