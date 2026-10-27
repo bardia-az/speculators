@@ -13,6 +13,7 @@ Newton-Schulz orthogonalization dispatches across ranks automatically.
 """
 
 import logging
+from collections.abc import Iterable
 
 import torch
 from torch import Tensor
@@ -34,6 +35,68 @@ _ADAMW_NAME_HINTS = (
 
 # Muon only orthogonalizes 2D weight matrices.
 _MATRIX_NDIM = 2
+
+
+def model_lr_scales(model: Module) -> dict[str, float]:
+    """Per-parameter LR multipliers a model opts into, empty for most models.
+
+    A model that wants per-parameter learning rates (e.g. dnest, whose
+    target-copied parameters can train at ``copied_lr_scale`` of the base LR)
+    implements ``optimizer_param_lr_scales() -> dict[str, float]`` mapping
+    state-dict parameter names to their multiplier. Entries equal to 1.0 are
+    dropped so an all-defaults model is indistinguishable from one without
+    the hook.
+    """
+    fn = getattr(model, "optimizer_param_lr_scales", None)
+    if not callable(fn):
+        return {}
+    return {name: scale for name, scale in fn().items() if scale != 1.0}
+
+
+def split_by_lr_scale(
+    named_params: Iterable[tuple[str, Tensor]],
+    lr_scales: dict[str, float],
+) -> tuple[list[Tensor], dict[float, list[Tensor]]]:
+    """Partition named parameters by LR scale: (base params, {scale: params}).
+
+    Parameters absent from ``lr_scales`` (or with scale 1.0) form the base
+    list; the rest group by their exact scale value. Names are dropped after
+    partitioning -- optimizers only need the tensors.
+    """
+    base: list[Tensor] = []
+    scaled: dict[float, list[Tensor]] = {}
+    for name, param in named_params:
+        scale = lr_scales.get(name)
+        if scale is None:
+            base.append(param)
+        else:
+            scaled.setdefault(float(scale), []).append(param)
+    return base, scaled
+
+
+def _log_group_sizes(base: int, scaled: dict[float, list], optimizer: str) -> None:
+    parts = [f"{base} @ base lr"] + [
+        f"{len(params)} @ {scale:.4g}x" for scale, params in sorted(scaled.items())
+    ]
+    logger.info("%s optimizer param groups: %s.", optimizer, ", ".join(parts))
+
+
+def _scaled_param_groups(
+    named_params: Iterable[tuple[str, Tensor]],
+    base_lr: float,
+    lr_scales: dict[str, float],
+    optimizer: str,
+) -> list[dict]:
+    """Param groups partitioned by LR scale (see :func:`split_by_lr_scale`),
+    with the group sizes logged."""
+    base, scaled = split_by_lr_scale(named_params, lr_scales)
+    groups: list[dict] = []
+    if base:
+        groups.append({"params": base, "lr": base_lr})
+    for scale, params in sorted(scaled.items()):
+        groups.append({"params": params, "lr": base_lr * scale})
+    _log_group_sizes(len(base), scaled, optimizer)
+    return groups
 
 
 def split_named_params_for_muon(
@@ -75,9 +138,20 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         "adamw" returns a single optimizer; "muon" returns ``[Muon, AdamW]``.
     """
     if config.optimizer == "adamw":
+        lr_scales = model_lr_scales(model)
+        if not lr_scales:
+            return [
+                torch.optim.AdamW(
+                    model.named_parameters(),
+                    lr=config.lr,
+                    weight_decay=config.weight_decay,
+                )
+            ]
         return [
             torch.optim.AdamW(
-                model.named_parameters(),
+                _scaled_param_groups(
+                    model.named_parameters(), config.lr, lr_scales, "AdamW"
+                ),
                 lr=config.lr,
                 weight_decay=config.weight_decay,
             )
@@ -90,12 +164,18 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
             len(muon_params),
             len(adamw_params),
         )
+        lr_scales = model_lr_scales(model)
+
+        def _groups(
+            named: list[tuple[str, Tensor]], base_lr: float
+        ) -> list[dict]:
+            return _scaled_param_groups(named, base_lr, lr_scales, "Muon")
 
         optimizers: list[torch.optim.Optimizer] = []
         if muon_params:
             optimizers.append(
                 torch.optim.Muon(
-                    muon_params,
+                    _groups(muon_params, config.muon_lr),
                     lr=config.muon_lr,
                     momentum=config.muon_momentum,
                     weight_decay=config.muon_weight_decay,
@@ -106,7 +186,7 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         if adamw_params:
             optimizers.append(
                 torch.optim.AdamW(
-                    adamw_params,
+                    _groups(adamw_params, config.lr),
                     lr=config.lr,
                     weight_decay=config.weight_decay,
                 )
