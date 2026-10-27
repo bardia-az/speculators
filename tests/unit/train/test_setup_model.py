@@ -25,6 +25,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
 )
+from transformers import get_linear_schedule_with_warmup
 from transformers.models.llama.configuration_llama import LlamaConfig
 
 from speculators import SpeculatorsConfig, VerifierConfig
@@ -192,6 +193,19 @@ def checkpoint_dir(tmp_path, tiny_model_on_gpu):
     ckpt_dir = tmp_path / "ckpt"
     checkpointer = SingleGPUCheckpointer(ckpt_dir)
     optimizer = torch.optim.AdamW(tiny_model_on_gpu.parameters(), lr=1e-4)
+    # Real checkpoints always carry stepped optimizer state (Adam moments)
+    # and scheduler-stamped param_groups (`initial_lr`): take one
+    # zero-gradient step (materializes the moments without moving the
+    # 42.0-filled weights) and build a scheduler before saving, so the
+    # fabricated checkpoint matches what a real run writes.
+    for p in tiny_model_on_gpu.parameters():
+        if p.requires_grad:
+            p.grad = torch.zeros_like(p)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=0, num_training_steps=1
+    )
     checkpointer.save_checkpoint(tiny_model_on_gpu, optimizer, epoch=0)
     return ckpt_dir
 
