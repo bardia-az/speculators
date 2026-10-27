@@ -127,6 +127,7 @@ def _make_trainer(
     trained_steps: list[tuple[int, int, int]],
     resume: bool = False,
     epochs: int = 1,
+    **config_overrides: object,
 ) -> _MockTrainer:
     cfg = TrainerConfig(
         save_path=save_path,
@@ -136,6 +137,7 @@ def _make_trainer(
         checkpoint_freq=0.3,
         log_freq=1,
         scheduler_type="none",
+        **config_overrides,
     )
     trainer = _MockTrainer(_dummy_model(), cfg, _make_loader())
     trainer._trained_steps = trained_steps
@@ -403,3 +405,69 @@ def test_fast_skip_sampler_slice_avoids_skipped_getitem(
         assert sampler.generated_for_epoch == 0
         assert sampler._cached_generated_batches == (0, sampler.all_batches[3:])
         assert dataset.seen_indices == list(range(3, 10))
+
+
+# ---------------------------------------------------------------------------
+# Eval snapshots (--eval-snapshots)
+# ---------------------------------------------------------------------------
+
+
+def test_eval_snapshots_kept_per_step(
+    trained_steps: list[tuple[int, int, int]],
+) -> None:
+    """--eval-snapshots copies each sub-epoch state into stepNNNNNN/ (model,
+    config, snapshot_meta.json) so no interval is lost to the overwriting
+    <epoch> dir."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t = _make_trainer(tmpdir, trained_steps=trained_steps, eval_snapshots=True)
+        ckpt_dir = Path(tmpdir) / "0"
+        ckpt_dir.mkdir()
+        (ckpt_dir / "model.safetensors").write_bytes(b"weights")
+        (ckpt_dir / "config.json").write_text("{}")
+
+        for step in (3, 6):
+            t.global_step = step
+            t.maybe_save_checkpoint(0, local_step=step)
+
+        for step in (3, 6):
+            snap = Path(tmpdir) / f"step{step:06d}"
+            assert snap.is_dir(), f"missing snapshot {snap}"
+            assert (snap / "model.safetensors").read_bytes() == b"weights"
+            assert (snap / "config.json").exists()
+            meta = json.loads((snap / "snapshot_meta.json").read_text())
+            assert meta == {"epoch": 0, "local_step": step, "global_step": step}
+
+
+def test_eval_snapshots_ignored_by_resume(
+    trained_steps: list[tuple[int, int, int]],
+) -> None:
+    """The non-integer stepNNNNNN spelling keeps resume discovery on integer
+    epoch dirs: the snapshot is not mistaken for a resumable epoch."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t = _make_trainer(tmpdir, trained_steps=trained_steps, eval_snapshots=True)
+        (Path(tmpdir) / "0").mkdir()
+        t.global_step = 3
+        t.maybe_save_checkpoint(0, local_step=3)
+
+        ckpt = SingleGPUCheckpointer(Path(tmpdir))
+        assert ckpt.previous_epoch == 0, "snapshot dir confused resume discovery"
+
+
+def test_eval_snapshot_keep_prunes_oldest(
+    trained_steps: list[tuple[int, int, int]],
+) -> None:
+    """--eval-snapshot-keep N retains only the newest N step snapshots."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t = _make_trainer(
+            tmpdir,
+            trained_steps=trained_steps,
+            eval_snapshots=True,
+            eval_snapshot_keep=1,
+        )
+        (Path(tmpdir) / "0").mkdir()
+        for step in (3, 6, 9):
+            t.global_step = step
+            t.maybe_save_checkpoint(0, local_step=step)
+
+        snaps = sorted(p.name for p in Path(tmpdir).glob("step[0-9]*"))
+        assert snaps == ["step000009"]
