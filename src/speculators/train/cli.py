@@ -751,6 +751,8 @@ def main(cfg: TrainConfig):  # noqa: C901
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
         checkpoint_freq=args.checkpoint_freq,
         save_best=args.save_best,
+        eval_snapshots=args.eval_snapshots,
+        eval_snapshot_keep=args.eval_snapshot_keep,
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,

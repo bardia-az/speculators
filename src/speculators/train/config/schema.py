@@ -413,6 +413,22 @@ class TrainerArgs(_Group):
         default=False,
         description="Also point a checkpoint at the lowest validation loss.",
     )
+    eval_snapshots: bool = Field(
+        default=False,
+        description="Alongside each sub-epoch checkpoint (checkpoint_freq < 1), "
+        "copy a model+config-only snapshot into checkpoints/stepNNNNNN/ so "
+        "acceptance can be evaluated along training (scripts/"
+        "eval_dnest_sweep.py). Unlike the sub-epoch save itself (which "
+        "overwrites checkpoints/<epoch> for crash-resume), snapshots are "
+        "retained individually; they are ignored by resume and deleted by "
+        "--save-best retention. Disk cost ~= 1 checkpoint per interval.",
+    )
+    eval_snapshot_keep: int = Field(
+        default=0,
+        ge=0,
+        description="With --eval-snapshots, keep only the newest N step "
+        "snapshots (0 keeps all).",
+    )
     no_resume_from_checkpoint: bool = Field(
         default=False, description="Do not resume training from an existing checkpoint."
     )
