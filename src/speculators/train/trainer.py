@@ -149,6 +149,8 @@ class TrainerConfig(NamedTuple):
     scheduler_num_cosine_cycles: float = 0.5
     checkpoint_freq: float = 1
     save_best: bool = False
+    eval_snapshots: bool = False
+    eval_snapshot_keep: int = 0
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
     fsdp_shard: bool = False
@@ -684,7 +686,50 @@ class Trainer:
                     if old.is_symlink():
                         old.unlink()
                 link_name.symlink_to(target)
+            if local_step > 0 and self.config.eval_snapshots:
+                self._save_eval_snapshot(epoch, local_step)
         root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(epoch)}")
+
+    def _save_eval_snapshot(self, epoch: int, local_step: int) -> None:
+        """Copy a model+config-only snapshot for along-training evaluation.
+
+        The sub-epoch checkpoint itself overwrites ``checkpoints/<epoch>``
+        (that directory is what crash-resume reads), so each interval's state
+        would otherwise be lost. The snapshot keeps it separately under a
+        ``stepNNNNNN`` name whose non-integer spelling makes
+        ``_get_previous_epoch`` skip it on resume. Optimizer state is
+        deliberately not copied: snapshots exist for evaluation
+        (scripts/eval_dnest_sweep.py), not for resuming.
+        """
+        import shutil  # noqa: PLC0415
+
+        if self.is_distributed and dist.get_rank() != 0:
+            return
+        ckpt_dir = self.checkpointer.path / str(epoch)
+        snap_dir = self.checkpointer.path / f"step{self.global_step:06d}"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        for fname in ("model.safetensors", "config.json"):
+            src = ckpt_dir / fname
+            if src.exists():
+                shutil.copy2(src, snap_dir / fname)
+        (snap_dir / "snapshot_meta.json").write_text(
+            json.dumps(
+                {
+                    "epoch": epoch,
+                    "local_step": local_step,
+                    "global_step": self.global_step,
+                }
+            )
+        )
+        keep = self.config.eval_snapshot_keep
+        if keep > 0:
+            snaps = sorted(
+                d
+                for d in self.checkpointer.path.glob("step[0-9]*")
+                if d.is_dir()
+            )
+            for old in snaps[:-keep]:
+                shutil.rmtree(old, ignore_errors=True)
 
     def maybe_update_best(self, epoch: int, val_metrics: dict | None):
         if val_metrics is None or "loss_epoch" not in val_metrics:

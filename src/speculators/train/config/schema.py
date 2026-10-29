@@ -413,6 +413,22 @@ class TrainerArgs(_Group):
         default=False,
         description="Also point a checkpoint at the lowest validation loss.",
     )
+    eval_snapshots: bool = Field(
+        default=False,
+        description="Alongside each sub-epoch checkpoint (checkpoint_freq < 1), "
+        "copy a model+config-only snapshot into checkpoints/stepNNNNNN/ so "
+        "acceptance can be evaluated along training (scripts/"
+        "eval_dnest_sweep.py). Unlike the sub-epoch save itself (which "
+        "overwrites checkpoints/<epoch> for crash-resume), snapshots are "
+        "retained individually; they are ignored by resume and deleted by "
+        "--save-best retention. Disk cost ~= 1 checkpoint per interval.",
+    )
+    eval_snapshot_keep: int = Field(
+        default=0,
+        ge=0,
+        description="With --eval-snapshots, keep only the newest N step "
+        "snapshots (0 keeps all).",
+    )
     no_resume_from_checkpoint: bool = Field(
         default=False, description="Do not resume training from an existing checkpoint."
     )
@@ -561,6 +577,56 @@ class DSparkArgs(_Group):
     )
 
 
+class DNestArgs(_Group):
+    """dnest-exclusive target-derived initialisation knobs.
+
+    dnest is DFlash with optional initialisation of the draft decoder layers
+    from target-model layers; these knobs select the source layers and the
+    treatment of the copied parameters. They are saved on the checkpoint
+    config for reproducibility.
+    """
+
+    init_mode: (
+        Literal["random", "target_after_extracted", "target_last", "target_explicit"]
+        | None
+    ) = Field(
+        default=None,
+        description="How the draft decoder layers are initialised on a fresh "
+        "training run: 'random' (DFlash baseline), 'target_after_extracted' "
+        "(default; draft layer j from the target layer that consumes the j-th "
+        "extracted hidden state), 'target_last' (the target's last N layers), "
+        "or 'target_explicit' (from --init-source-layers). Never applied when "
+        "resuming from a checkpoint.",
+    )
+    init_source_layers: list[int] | None = Field(
+        default=None,
+        description="Target layer indices (0-based, space-separated) to copy "
+        "the draft layers from; required with --init-mode target_explicit, "
+        "ignored otherwise. Count must equal --num-layers.",
+    )
+    fusion_init: Literal["random", "passthrough_deepest"] | None = Field(
+        default=None,
+        description="Fusion projection initialisation: 'random' (default) or "
+        "'passthrough_deepest' -- the projection initially returns exactly the "
+        "deepest extracted hidden state; the following hidden_norm rescales "
+        "it to unit RMS per token (the closest equivalent; an exact "
+        "passthrough cannot be expressed through a fixed-weight RMSNorm).",
+    )
+    copied_lr_scale: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Learning-rate multiplier for parameters initialised from "
+        "the target (a separate optimizer parameter group). Default 1.0.",
+    )
+    init_final_norm: bool | None = Field(
+        default=None,
+        description="Also initialise the draft's final norm (before the LM "
+        "head) from the target's final norm. Default off (DFlash initialises "
+        "it randomly; the frozen 'verifier_norm' used for target logits is a "
+        "different module and is always loaded from the target).",
+    )
+
+
 class PEagleArgs(_Group):
     num_depths: int = Field(
         default=8,
@@ -599,6 +665,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "logging": LoggingArgs,
     "dflash": DFlashArgs,
     "dflash2": DFlash2Args,
+    "dnest": DNestArgs,
     "dspark": DSparkArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
@@ -683,7 +750,7 @@ class TrainConfig(BaseSettings):
     speculator_type: str = Field(
         default="eagle3",
         description="Type of speculator model to train "
-        "(eagle3, dflash, dflash2, dspark, dflex, peagle, mtp).",
+        "(eagle3, dflash, dflash2, dspark, dflex, dnest, peagle, mtp).",
     )
     dry_run: bool = Field(
         default=False,
@@ -709,6 +776,7 @@ class TrainConfig(BaseSettings):
     logging: LoggingArgs = Field(default_factory=LoggingArgs)
     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
     dflash2: DFlash2Args = Field(default_factory=DFlash2Args)
+    dnest: DNestArgs = Field(default_factory=DNestArgs)
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
@@ -748,12 +816,13 @@ class TrainConfig(BaseSettings):
         untouched, so :meth:`from_flat` round-trips.
         """
         is_eagle3 = self.speculator_type == "eagle3"
-        is_dflash = self.speculator_type in {"dflash", "dflex"}
+        is_dflash = self.speculator_type in {"dflash", "dflex", "dnest"}
         is_dflash_family = self.speculator_type in {
             "dflash",
             "dspark",
             "dflash2",
             "dflex",
+            "dnest",
         }
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
@@ -803,10 +872,47 @@ class TrainConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _validate_dnest_args(self) -> "TrainConfig":
+        """``--init-mode`` & co. are dnest-only (other types' configs do not
+        declare these fields, so a set value could only be silently dropped),
+        and ``target_explicit`` needs its source list."""
+        if self.speculator_type != "dnest":
+            set_fields = [
+                name
+                for name in ("init_mode", "init_source_layers", "fusion_init",
+                             "copied_lr_scale", "init_final_norm")
+                if getattr(self.dnest, name) is not None
+            ]
+            if set_fields:
+                raise ValueError(
+                    f"--{set_fields[0].replace('_', '-')} (dnest target-derived "
+                    "initialisation) is only implemented for "
+                    "--speculator-type=dnest"
+                )
+        if (
+            self.speculator_type == "dnest"
+            and self.dnest.init_mode == "target_explicit"
+            and not self.dnest.init_source_layers
+        ):
+            raise ValueError(
+                "--init-mode target_explicit requires --init-source-layers "
+                "(a space-separated list of target layer indices)."
+            )
+        if (
+            self.dnest.init_source_layers
+            and self.dnest.init_mode != "target_explicit"
+        ):
+            raise ValueError(
+                "--init-source-layers is only used with "
+                "--init-mode target_explicit."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_attention_mode(self) -> "TrainConfig":
-        """``--attention-mode`` is dflex-only: DFlash/DSpark/DFlash2 keep the
-        legacy ``sliding_window_non_causal`` in-block rule (their configs do
-        not even declare the field, so a set value could only be silently
+        """``--attention-mode`` is dflex-only: DFlash/DSpark/DFlash2/dnest keep
+        the legacy ``sliding_window_non_causal`` in-block rule (their configs
+        do not even declare the field, so a set value could only be silently
         dropped)."""
         if self.dflash.attention_mode is not None and self.speculator_type != "dflex":
             raise ValueError(
