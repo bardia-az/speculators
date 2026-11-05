@@ -66,7 +66,9 @@ def _fake_batch() -> dict[str, torch.Tensor]:
     }
 
 
-def _make_val_trainer(n_batches: int, *, is_distributed: bool) -> "Trainer":
+def _make_val_trainer(
+    n_batches: int, *, is_distributed: bool, val_max_batches: int | None = None
+) -> "Trainer":
     model = MagicMock()
     model.return_value = (
         None,
@@ -94,6 +96,7 @@ def _make_val_trainer(n_batches: int, *, is_distributed: bool) -> "Trainer":
         save_path="/tmp",
         hidden_states_dtype=torch.float32,
         val_call_kwargs=None,
+        val_max_batches=val_max_batches,
     )
     return trainer
 
@@ -125,3 +128,33 @@ def test_val_epoch_empty_loader_returns_empty_metrics():
     trainer = _make_val_trainer(0, is_distributed=False)
     result = trainer.val_epoch(0)
     assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# val_max_batches cap
+# ---------------------------------------------------------------------------
+
+
+def test_val_epoch_respects_val_max_batches_cap():
+    trainer = _make_val_trainer(120, is_distributed=False, val_max_batches=30)
+    trainer.val_epoch(0)
+    assert trainer.model.call_count == 30
+
+
+def test_val_epoch_cap_above_loader_length_runs_all():
+    trainer = _make_val_trainer(40, is_distributed=False, val_max_batches=500)
+    trainer.val_epoch(0)
+    assert trainer.model.call_count == 40
+
+
+def test_val_epoch_cap_keeps_barrier_schedule_consistent():
+    trainer = _make_val_trainer(120, is_distributed=True, val_max_batches=70)
+    with (
+        patch("speculators.train.trainer._VAL_SYNC_INTERVAL", 50),
+        patch("speculators.train.trainer.dist.barrier") as barrier,
+        patch("speculators.train.trainer.dist.all_reduce"),
+        patch("speculators.train.trainer.dist.get_world_size", return_value=1),
+    ):
+        trainer.val_epoch(0)
+        # The capped horizon drives the schedule: (70 - 1) // 50 == 1 barrier.
+        assert barrier.call_count == 1

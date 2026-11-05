@@ -156,6 +156,7 @@ class TrainerConfig(NamedTuple):
     fsdp_shard: bool = False
     gradient_checkpointing: bool = False
     max_steps: int | None = None
+    val_max_batches: int | None = None
 
 
 def _resolve_scheduler_steps(
@@ -614,8 +615,15 @@ class Trainer:
 
         accumulated: dict[str, torch.Tensor] = {}
         num_batches = len(val_loader)
+        # Smoke-run cap: bound the pass like max_steps bounds training. Applied
+        # to num_batches so the recovery-sync schedule and (in distributed
+        # runs) the barrier intervals stay consistent with the capped horizon.
+        if self.config.val_max_batches is not None:
+            num_batches = min(num_batches, self.config.val_max_batches)
         recovery = BatchRecoveryCoordinator("validation")
         for i, batch in enumerate(val_loader):
+            if i >= num_batches:
+                break
             self._maybe_val_sync(i)
             recovery.consume(
                 batch,

@@ -263,3 +263,23 @@ def test_max_steps_explicit(monkeypatch):
 def test_max_steps_rejects_non_positive(monkeypatch):
     with pytest.raises(SystemExit):
         _parse(monkeypatch, ["--max-steps", "0"])
+
+
+# ---------------------------------------------------------------------------
+# --val-max-batches
+# ---------------------------------------------------------------------------
+
+
+def test_val_max_batches_default_is_none(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.val_max_batches is None
+
+
+def test_val_max_batches_explicit(monkeypatch):
+    args = _parse(monkeypatch, ["--val-max-batches", "32"])
+    assert args.val_max_batches == 32
+
+
+def test_val_max_batches_rejects_non_positive(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(monkeypatch, ["--val-max-batches", "0"])

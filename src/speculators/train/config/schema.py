@@ -457,6 +457,14 @@ class TrainerArgs(_Group):
         description="Stop training after this many optimizer steps (counted across "
         "epochs). Useful for quick smoke runs. Default: run all epochs to completion.",
     )
+    val_max_batches: int | None = Field(
+        default=None,
+        ge=1,
+        description="Evaluate at most this many validation batches per validation "
+        "pass (the training-loop analogue of max_steps for validation). Useful for "
+        "smoke runs on the full dataset, where the complete validation split can "
+        "take hours. Default: validate on the entire split.",
+    )
 
     @field_validator("checkpoint_freq")
     @classmethod

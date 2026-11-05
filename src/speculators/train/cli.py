@@ -758,6 +758,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         fsdp_shard=args.fsdp_shard,
         gradient_checkpointing=args.gradient_checkpointing,
         max_steps=args.max_steps,
+        val_max_batches=args.val_max_batches,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
