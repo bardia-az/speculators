@@ -44,9 +44,23 @@ def select_anchors(
     valid_mask = loss_mask.bool().clone()
     valid_mask[:, -block_size:] = False
 
-    valid_indices = torch.nonzero(valid_mask.squeeze(0), as_tuple=False).squeeze(
-        -1
-    )  # shape: [num_non_zero]
+    # aclnnNonzero (dynamic output shape) hits spontaneous CANN 507001
+    # task-scheduler faults on Ascend under sustained use (observed ~2,100
+    # batches into NPU validation). The [T] bool mask is a few KB — compact
+    # on CPU there; the numel() read below syncs anyway. CUDA keeps the
+    # original all-device path (dynamo fullgraph coverage depends on it).
+    if loss_mask.device.type == "npu":
+        valid_indices = (
+            valid_mask.squeeze(0)
+            .to("cpu")
+            .nonzero(as_tuple=False)
+            .squeeze(-1)
+            .to(loss_mask.device)
+        )  # shape: [num_non_zero]
+    else:
+        valid_indices = torch.nonzero(valid_mask.squeeze(0), as_tuple=False).squeeze(
+            -1
+        )  # shape: [num_non_zero]
 
     device = loss_mask.device
     anchors = torch.zeros(num_anchors, dtype=torch.long, device=device)

@@ -55,10 +55,16 @@ def compute_accuracy_single_step(
         cond_total = prev_correct.sum().float()
         correct = torch.logical_and(prev_correct, correct, out=prev_correct)
     if loss_mask is not None:
-        correct = torch.masked_select(correct, loss_mask.to(torch.bool))
-
-    correct_sum = correct.float().sum()
-    full_total = torch.tensor(correct.numel(), dtype=torch.float, device=correct.device)
+        # Weighted reduction instead of masked_select compaction: masked_select
+        # lowers to NonZero (dynamic output shape), which hits spontaneous
+        # CANN 507001 task-scheduler faults on Ascend under sustained use.
+        # Same counts, fixed shapes, no hidden device sync.
+        weight = loss_mask.to(torch.bool).to(torch.float)
+        correct_sum = (correct.to(torch.float) * weight).sum()
+        full_total = weight.sum()
+    else:
+        correct_sum = correct.float().sum()
+        full_total = torch.tensor(correct.numel(), dtype=torch.float, device=correct.device)
 
     return correct_sum, full_total, correct_sum.clone(), cond_total
 
@@ -85,12 +91,16 @@ def compute_accuracy_multi_step(
         Overall counts can be derived by summing these.
     """
     correct = pred_ids == target_ids
-    correct = torch.masked_select(correct, loss_mask.to(torch.bool))
-    pos_idx = torch.masked_select(pos_idx, loss_mask.to(torch.bool))
+    # Weighted scatter instead of masked_select compaction (dynamic output
+    # shape -> NonZero -> spontaneous CANN 507001 faults on Ascend); identical
+    # per-position counts with fixed shapes.
+    weight = loss_mask.to(torch.bool).to(torch.float).reshape(-1)
 
     correct_per_pos = torch.zeros(num_pos, dtype=torch.float, device=correct.device)
     total_per_pos = torch.zeros(num_pos, dtype=torch.float, device=correct.device)
-    correct_per_pos.scatter_add_(0, pos_idx, correct.float())
-    total_per_pos.scatter_add_(0, pos_idx, torch.ones_like(correct, dtype=torch.float))
+    correct_per_pos.scatter_add_(
+        0, pos_idx.reshape(-1), correct.reshape(-1).to(torch.float) * weight
+    )
+    total_per_pos.scatter_add_(0, pos_idx.reshape(-1), weight)
 
     return correct_per_pos, total_per_pos  # shape: [num_pos], [num_pos]
