@@ -12,10 +12,13 @@ Maps to the dnest test plan:
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 from pydantic import ValidationError
+from torch.nn.parallel import DistributedDataParallel
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3DecoderLayer,
@@ -446,8 +449,6 @@ def test_passthrough_fusion_unsorted_aux_ids():
 
 
 def test_optimizer_lr_groups(target_dir):
-    from types import SimpleNamespace
-
     _, path = target_dir
     model = _build_dnest(
         path, init_mode="target_after_extracted", copied_lr_scale=0.1
@@ -472,6 +473,38 @@ def test_optimizer_lr_groups(target_dir):
     single = build_optimizers(plain, config)[0]
     assert len(single.param_groups) == 1
     assert single.param_groups[0]["lr"] == 1e-3
+
+
+def test_optimizer_lr_groups_through_ddp_wrapper(target_dir, tmp_path):
+    """Regression: the trainer wraps the model in DDP *before* building the
+    optimizers. The wrapper hides ``optimizer_param_lr_scales`` and renames
+    parameters (``module.`` prefix), which silently dropped dnest's
+    copied-LR groups in every distributed run -- ``build_optimizers`` must
+    unwrap and produce the same two groups as the bare model."""
+    _, path = target_dir
+    model = _build_dnest(
+        path, init_mode="target_after_extracted", copied_lr_scale=0.1
+    )
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("gloo backend unavailable")
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path}/ddp_pg", rank=0, world_size=1
+    )
+    try:
+        wrapped = DistributedDataParallel(model)
+        config = SimpleNamespace(
+            optimizer="adamw", lr=1e-3, weight_decay=0.0
+        )
+        optimizer = build_optimizers(wrapped, config)[0]
+        lrs = {round(group["lr"], 10) for group in optimizer.param_groups}
+        assert lrs == {1e-3, 1e-4}
+        scaled = [g for g in optimizer.param_groups if abs(g["lr"] - 1e-4) < 1e-12]
+        assert len(scaled[0]["params"]) == 2 * len(COPIED_LAYER_SUFFIXES)
+        # the optimizer holds the wrapped module's tensors, not copies
+        opt_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
+        assert opt_ids == {id(p) for p in model.parameters()}
+    finally:
+        dist.destroy_process_group()
 
 
 # --- config defaults ---------------------------------------------------------

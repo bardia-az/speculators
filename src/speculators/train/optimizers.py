@@ -18,6 +18,7 @@ from collections.abc import Iterable
 import torch
 from torch import Tensor
 from torch.nn import Module
+from torch.nn.parallel import DistributedDataParallel
 
 logger = logging.getLogger("speculators")
 
@@ -129,14 +130,32 @@ def split_named_params_for_muon(
     return muon_params, adamw_params
 
 
+def _unwrap_ddp(model: Module) -> Module:
+    """See through a ``DistributedDataParallel`` wrapper to the wrapped module.
+
+    DDP hides the wrapped module's attributes -- a model's
+    ``optimizer_param_lr_scales`` hook is invisible on the wrapper -- and
+    prefixes every parameter name with ``module.``, so optimizer construction,
+    which resolves parameters by name, must operate on the wrapped module.
+    Optimizing those tensors directly is the standard DDP pattern: they are
+    the same tensors DDP synchronizes gradients for.
+    """
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
 def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
     """Build the optimizer(s) for a training run based on ``config.optimizer``.
+
+    Accepts either a bare model or one wrapped in ``DistributedDataParallel``
+    (the trainer wraps first and builds the optimizer second); DDP wrappers
+    are unwrapped internally.
 
     :param model: The model to optimize.
     :param config: A ``TrainerConfig`` holding the optimizer hyperparameters.
     :return: A list of optimizers for the trainer to step in tandem. The default
         "adamw" returns a single optimizer; "muon" returns ``[Muon, AdamW]``.
     """
+    model = _unwrap_ddp(model)
     if config.optimizer == "adamw":
         lr_scales = model_lr_scales(model)
         if not lr_scales:
