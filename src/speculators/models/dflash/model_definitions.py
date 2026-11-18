@@ -94,6 +94,37 @@ class Qwen3DFlashAttention(nn.Module):
             else None
         )
 
+    def _context_kv(
+        self, target_hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project the context feature to (context keys, context values).
+
+        The DFlash-family default runs the context feature through the same
+        projections the block keys/values use. dnest's per-layer ``split``
+        mode overrides this to route through its frozen ``context_kv`` path.
+        """
+        return self.k_proj(target_hidden), self.v_proj(target_hidden)
+
+    def _norm_context_and_block_keys(
+        self,
+        k_ctx: torch.Tensor,
+        k_noise: torch.Tensor,
+        bsz: int,
+        ctx_len: int,
+        q_len: int,
+    ) -> torch.Tensor:
+        """k_norm over the concatenated [context; block] keys -> [B, L, H, D].
+
+        Default: one shared k_norm across the concatenation. RMSNorm is
+        elementwise per position and head, so this equals norming each part
+        separately -- the dnest ``split`` override relies on that identity
+        when it norms each part with its own (context vs block) k_norm.
+        """
+        k = torch.cat([k_ctx, k_noise], dim=1).view(
+            bsz, ctx_len + q_len, -1, self.head_dim
+        )
+        return self.k_norm(k)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -113,18 +144,16 @@ class Qwen3DFlashAttention(nn.Module):
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
         # This is the main difference from the usual attention mechanism.
-        k_ctx = self.k_proj(target_hidden)
+        k_ctx, v_ctx = self._context_kv(target_hidden)
         k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
-        k = torch.cat([k_ctx, k_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
         # note the length becomes context length + block size
+        k = self._norm_context_and_block_keys(
+            k_ctx, k_noise, bsz, ctx_len, q_len
+        ).transpose(1, 2)
         v = torch.cat([v_ctx, v_noise], dim=1).view(
             bsz, ctx_len + q_len, -1, self.head_dim
         )
-        k = self.k_norm(k).transpose(1, 2)
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
@@ -156,10 +185,15 @@ class Qwen3DFlashAttention(nn.Module):
 
 
 class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
+    # Subclasses swap the attention implementation (e.g. dnest's per-layer
+    # context path) by overriding this class attribute; the RNG draws at
+    # construction are identical to the base class's.
+    attention_cls: type[Qwen3DFlashAttention] = Qwen3DFlashAttention
+
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3DFlashAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = self.attention_cls(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # type: ignore[arg-type]
         self.post_attention_layernorm = Qwen3RMSNorm(

@@ -75,11 +75,30 @@ def split_by_lr_scale(
     return base, scaled
 
 
-def _log_group_sizes(base: int, scaled: dict[float, list], optimizer: str) -> None:
-    parts = [f"{base} @ base lr"] + [
-        f"{len(params)} @ {scale:.4g}x" for scale, params in sorted(scaled.items())
+def _log_group_sizes(
+    base: int, scaled: dict[float, list], optimizer: str, base_lr: float
+) -> None:
+    parts = [f"{base} @ lr {base_lr:.3e} (base)"] + [
+        f"{len(params)} @ lr {base_lr * scale:.3e} ({scale:.4g}x)"
+        for scale, params in sorted(scaled.items())
     ]
     logger.info("%s optimizer param groups: %s.", optimizer, ", ".join(parts))
+
+
+def _log_trainable_totals(model: Module) -> None:
+    """One startup line with the frozen/trainable split (see build_optimizers)."""
+    total = sum(p.numel() for _, p in model.named_parameters())
+    trainable = sum(p.numel() for _, p in model.named_parameters() if p.requires_grad)
+    n_frozen = sum(
+        1 for _, p in model.named_parameters() if not p.requires_grad
+    )
+    logger.info(
+        "Trainable parameters: %.2fM of %.2fM total (%d tensors frozen, "
+        "excluded from every optimizer).",
+        trainable / 1e6,
+        total / 1e6,
+        n_frozen,
+    )
 
 
 def _scaled_param_groups(
@@ -89,14 +108,14 @@ def _scaled_param_groups(
     optimizer: str,
 ) -> list[dict]:
     """Param groups partitioned by LR scale (see :func:`split_by_lr_scale`),
-    with the group sizes logged."""
+    with the group sizes and learning rates logged."""
     base, scaled = split_by_lr_scale(named_params, lr_scales)
     groups: list[dict] = []
     if base:
         groups.append({"params": base, "lr": base_lr})
     for scale, params in sorted(scaled.items()):
         groups.append({"params": params, "lr": base_lr * scale})
-    _log_group_sizes(len(base), scaled, optimizer)
+    _log_group_sizes(len(base), scaled, optimizer, base_lr)
     return groups
 
 
@@ -156,12 +175,22 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         "adamw" returns a single optimizer; "muon" returns ``[Muon, AdamW]``.
     """
     model = _unwrap_ddp(model)
+    _log_trainable_totals(model)
+    # Frozen parameters (requires_grad=False) never reach an optimizer: they
+    # carry no optimizer state and cannot be updated. This also holds for the
+    # AdamW fast path below, matching what split_named_params_for_muon does
+    # for the Muon path.
+    trainable_named = [
+        (name, param)
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    ]
     if config.optimizer == "adamw":
         lr_scales = model_lr_scales(model)
         if not lr_scales:
             return [
                 torch.optim.AdamW(
-                    model.named_parameters(),
+                    trainable_named,
                     lr=config.lr,
                     weight_decay=config.weight_decay,
                 )
@@ -169,7 +198,7 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         return [
             torch.optim.AdamW(
                 _scaled_param_groups(
-                    model.named_parameters(), config.lr, lr_scales, "AdamW"
+                    trainable_named, config.lr, lr_scales, "AdamW"
                 ),
                 lr=config.lr,
                 weight_decay=config.weight_decay,

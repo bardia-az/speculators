@@ -29,6 +29,59 @@ from speculators.train.recovery import (
 BatchType = dict[str, Any]
 logger = logging.getLogger("speculators")
 
+TAP_LAYERS_MANIFEST = "tap_layers.json"
+
+
+def check_tap_layers_manifest(
+    hidden_states_path: str | PathLike[str] | None,
+    data_path: str | PathLike[str] | None,
+    target_layer_ids: list[int],
+) -> None:
+    """Cross-check the extraction manifest against the model's taps.
+
+    Hidden-state caches record which target layers produced them nowhere in
+    the tensors themselves, so a cache extracted with different
+    ``--target-layer-ids`` would silently misalign every tap. When the
+    generation side (the launcher script) wrote a ``tap_layers.json`` next
+    to the hidden states, this refuses to train on a cache whose taps differ
+    from the model's ``target_layer_ids``. A missing manifest is accepted
+    (older caches) with a one-time warning.
+
+    The manifest is a JSON object ``{"target_layer_ids": [...]}`` listing
+    the taps *excluding* the final verifier-last layer the launcher appends.
+    """
+    path = (
+        Path(hidden_states_path)
+        if hidden_states_path
+        else Path(data_path or ".") / "hidden_states"
+    )
+    manifest_path = path / TAP_LAYERS_MANIFEST
+    if not manifest_path.exists():
+        logger.warning(
+            "No %s next to the hidden states at %s -- cannot verify the "
+            "extraction taps match the model's target_layer_ids %s.",
+            TAP_LAYERS_MANIFEST,
+            path,
+            target_layer_ids,
+        )
+        return
+    import json  # noqa: PLC0415  (kept off the hot import path)
+
+    manifest = json.loads(manifest_path.read_text())
+    recorded = [int(layer_id) for layer_id in manifest.get("target_layer_ids", [])]
+    if recorded != list(target_layer_ids):
+        raise ValueError(
+            f"The hidden states at {path} were extracted from target layers "
+            f"{recorded} (per {TAP_LAYERS_MANIFEST}) but the model consumes "
+            f"taps {list(target_layer_ids)}. Regenerate the hidden states "
+            "with the model's --target-layer-ids (the same ids the vLLM "
+            "datagen server was launched with) or fix the model's taps."
+        )
+    logger.info(
+        "Hidden-state tap manifest OK: extraction layers %s match the model.",
+        recorded,
+    )
+
 
 def create_empty_sample(
     hidden_size: int, num_target_layers: int = 3, dtype: torch.dtype = torch.bfloat16

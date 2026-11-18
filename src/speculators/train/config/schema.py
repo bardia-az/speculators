@@ -624,7 +624,8 @@ class DNestArgs(_Group):
         default=None,
         ge=0.0,
         description="Learning-rate multiplier for parameters initialised from "
-        "the target (a separate optimizer parameter group). Default 1.0.",
+        "the target (a separate optimizer parameter group). Default 1.0. "
+        "Backward-compatible alias of --lr-scale-copied.",
     )
     init_final_norm: bool | None = Field(
         default=None,
@@ -632,6 +633,54 @@ class DNestArgs(_Group):
         "head) from the target's final norm. Default off (DFlash initialises "
         "it randomly; the frozen 'verifier_norm' used for target logits is a "
         "different module and is always loaded from the target).",
+    )
+    context_mode: Literal["fused", "per_layer"] | None = Field(
+        default=None,
+        description="How the draft layers condition on the target: 'fused' "
+        "(default; DFlash's single fused feature) or 'per_layer' -- each "
+        "draft layer j receives its own extracted hidden state (the input "
+        "of its source layer s_j) and computes context keys/values through "
+        "its key/value path exactly as the source layer would. per_layer "
+        "requires --target-layer-ids to equal the source layers (they "
+        "coincide automatically for target_after_extracted).",
+    )
+    kv_mode: (
+        Literal["frozen_shared", "split", "trainable_shared"] | None
+    ) = Field(
+        default=None,
+        description="Ownership of the per-layer key/value path "
+        "(--context-mode per_layer only): 'frozen_shared' (one path, frozen, "
+        "context keys/values exactly the target's), 'split' (frozen context "
+        "path + trainable block path), or 'trainable_shared' (one shared "
+        "trainable path; the only mode allowed with --init-mode random).",
+    )
+    lr_scale_new: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Learning-rate multiplier for newly created (non-copied) "
+        "trainable parameters; per-layer context mode only.",
+    )
+    lr_scale_copied: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Learning-rate multiplier for copied weights outside the "
+        "key/value paths (q_proj, o_proj, q_norm, post_attention_layernorm, "
+        "MLP, and in 'split' the block path's input_layernorm). Same knob as "
+        "--copied-lr-scale (the old name still works); in fused context mode "
+        "it scales the whole layer copy.",
+    )
+    lr_scale_context_kv: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Learning-rate multiplier for the shared key/value path "
+        "(input_layernorm + k_proj + v_proj + k_norm); kv_mode "
+        "'trainable_shared' only.",
+    )
+    lr_scale_block_kv: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Learning-rate multiplier for the block key/value path "
+        "(k_proj + v_proj + k_norm); kv_mode 'split' only.",
     )
 
 
@@ -883,12 +932,19 @@ class TrainConfig(BaseSettings):
     def _validate_dnest_args(self) -> "TrainConfig":
         """``--init-mode`` & co. are dnest-only (other types' configs do not
         declare these fields, so a set value could only be silently dropped),
-        and ``target_explicit`` needs its source list."""
+        ``target_explicit`` needs its source list, and the per-layer context
+        knobs require ``--context-mode per_layer`` (the fused mode is frozen
+        to DFlash's exact behaviour; the model config enforces the same rule
+        by value for serialized configs)."""
         if self.speculator_type != "dnest":
             set_fields = [
                 name
-                for name in ("init_mode", "init_source_layers", "fusion_init",
-                             "copied_lr_scale", "init_final_norm")
+                for name in (
+                    "init_mode", "init_source_layers", "fusion_init",
+                    "copied_lr_scale", "init_final_norm",
+                    "context_mode", "kv_mode", "lr_scale_new",
+                    "lr_scale_copied", "lr_scale_context_kv", "lr_scale_block_kv",
+                )
                 if getattr(self.dnest, name) is not None
             ]
             if set_fields:
@@ -914,6 +970,19 @@ class TrainConfig(BaseSettings):
                 "--init-source-layers is only used with "
                 "--init-mode target_explicit."
             )
+        if self.speculator_type == "dnest" and self.dnest.context_mode != "per_layer":
+            misplaced = [
+                name
+                for name in ("kv_mode", "lr_scale_new", "lr_scale_context_kv",
+                             "lr_scale_block_kv")
+                if getattr(self.dnest, name) is not None
+            ]
+            if misplaced:
+                raise ValueError(
+                    f"--{misplaced[0].replace('_', '-')} only applies with "
+                    "--context-mode per_layer (the fused mode keeps DFlash's "
+                    "exact behaviour)."
+                )
         return self
 
     @model_validator(mode="after")
