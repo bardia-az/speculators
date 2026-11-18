@@ -661,6 +661,18 @@ def main(cfg: TrainConfig):  # noqa: C901
     # Get target layer IDs from the model (resolved at model level)
     num_target_layers = len(draft_model.target_layer_ids)  # type: ignore[arg-type]
 
+    # Refuse to train on hidden states extracted from different taps than
+    # the model consumes (a no-op without a tap_layers.json manifest).
+    from speculators.train.data import (  # noqa: PLC0415
+        check_tap_layers_manifest,
+    )
+
+    check_tap_layers_manifest(
+        getattr(args, "hidden_states_path", None),
+        args.data_path,
+        draft_model.target_layer_ids,  # type: ignore[arg-type]
+    )
+
     if args.speculator_type == "mtp":
         args.num_speculative_steps = draft_model.config.num_speculative_steps
 
