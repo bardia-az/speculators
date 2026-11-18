@@ -318,6 +318,48 @@ def test_frozen_tensors_never_move(target_dir, kv_mode):
         assert id(model.get_parameter(name)) not in state_param_ids
 
 
+def test_per_layer_roundtrip_preserves_config_weights_and_freezing(
+    target_dir, tmp_path
+):
+    """save_pretrained -> from_pretrained: the per-layer config round-trips,
+    the frozen context tensors are bit-identical and re-frozen, and the
+    optimizer LR groups are rebuilt identically (resume identity)."""
+    from speculators.model import SpeculatorModel
+
+    _, path = target_dir
+    model = _build_per_layer(
+        path,
+        kv_mode="split",
+        lr_scale_new=0.5,
+        lr_scale_copied=0.1,
+        lr_scale_block_kv=0.2,
+    )
+    ctx_before = {
+        f"layers.{j}.self_attn.context_kv.{suffix}"
+        for j in range(2)
+        for suffix in CONTEXT_KV_SUFFIXES
+    }
+    weights_before = {
+        name: model.get_parameter(name).detach().clone() for name in ctx_before
+    }
+    scales_before = model.optimizer_param_lr_scales()
+
+    save_dir = tmp_path / "perlayer-roundtrip"
+    model.save_pretrained(save_dir)
+    reloaded = SpeculatorModel.from_pretrained(str(save_dir))
+
+    assert reloaded.config.context_mode == "per_layer"
+    assert reloaded.config.kv_mode == "split"
+    assert reloaded.config.lr_scale_block_kv == 0.2
+    for name, before in weights_before.items():
+        after = reloaded.get_parameter(name).detach()
+        assert torch.equal(before, after), f"{name} changed across save/load"
+        assert not reloaded.get_parameter(name).requires_grad, (
+            f"{name} not re-frozen after load"
+        )
+    assert reloaded.optimizer_param_lr_scales() == scales_before
+
+
 # --- 4. split separation ----------------------------------------------------
 
 
