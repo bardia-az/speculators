@@ -69,6 +69,30 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         """
         return Qwen3DFlashDecoderLayer(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
 
+    @property
+    def _use_fusion(self) -> bool:
+        """Whether the fused context feature (``fc`` + ``hidden_norm``) exists.
+
+        Variants that condition each layer on its own extracted hidden state
+        (dnest ``per_layer``) have no fusion projection and override this to
+        ``False``.
+        """
+        return True
+
+    def _context_features(
+        self, hidden_states: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Per-layer context features: the ``target_hidden`` each layer sees.
+
+        The DFlash-family default fuses every extracted hidden state into one
+        feature shared by all layers. ``hidden_states`` here is the
+        concatenation of the taps in ``target_layer_ids`` order.
+        """
+        fc_output = self.fc(hidden_states)
+        fc_output = self.hidden_norm(fc_output)
+        # shape: [1, total_seq_len, hidden_size]
+        return [fc_output] * len(self.layers)
+
     def __init__(
         self,
         config: DFlashSpeculatorConfig,
@@ -121,15 +145,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         rotary_config = flatten_rope_parameters(config.transformer_layer_config)
         self.rotary_emb = Qwen3RotaryEmbedding(rotary_config)  # type: ignore[arg-type]
 
-        self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,
-            config.transformer_layer_config.hidden_size,
-            bias=False,
-        )
-        self.hidden_norm = Qwen3RMSNorm(
-            config.transformer_layer_config.hidden_size,
-            eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
-        )
+        if self._use_fusion:
+            self.fc = nn.Linear(
+                len(self.target_layer_ids)
+                * config.transformer_layer_config.hidden_size,
+                config.transformer_layer_config.hidden_size,
+                bias=False,
+            )
+            self.hidden_norm = Qwen3RMSNorm(
+                config.transformer_layer_config.hidden_size,
+                eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
+            )
         self.verifier_norm = resolve_verifier_norm_class(config)(
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
@@ -456,9 +482,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
-        fc_output = self.fc(hidden_states)
-        fc_output = self.hidden_norm(fc_output)
-        # shape: [1, total_seq_len, hidden_size]
+        target_features = self._context_features(hidden_states)
+        # fused mode: one shared feature; per-layer variants carry one
+        # extracted hidden state per draft layer (see _context_features)
 
         mask_position_ids = get_base_indices_for_anchored_blocks(
             position_ids[0, anchor_positions], self.block_size
@@ -496,7 +522,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         for layer_idx, layer in enumerate(self.layers):
             noise_embedding = layer(
                 hidden_states=noise_embedding,
-                target_hidden=fc_output,
+                target_hidden=target_features[layer_idx],
                 attention_mask=sliding_window_attn_mask
                 if layer_idx in self.sliding_window_indices
                 else full_attn_mask,

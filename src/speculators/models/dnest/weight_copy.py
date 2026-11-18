@@ -13,12 +13,15 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from speculators.models.dnest.model_definitions import CONTEXT_KV_SUFFIXES
 from speculators.utils.loading import load_model_layers
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "BLOCK_KV_SUFFIXES",
     "COPIED_LAYER_SUFFIXES",
+    "KV_PATH_SUFFIXES",
     "check_layer_compatibility",
     "copy_target_decoder_layers",
     "init_fusion_passthrough_deepest",
@@ -41,6 +44,24 @@ COPIED_LAYER_SUFFIXES: tuple[str, ...] = (
     "mlp.down_proj.weight",
     "input_layernorm.weight",
     "post_attention_layernorm.weight",
+)
+
+# The key/value path inside a copied layer (layer-level suffixes, a subset
+# of COPIED_LAYER_SUFFIXES): input_layernorm feeding k/v_proj, plus k_norm.
+# dnest's per_layer context mode computes the context keys/values with
+# exactly these tensors (shared kv_modes) or a frozen copy of them (split).
+KV_PATH_SUFFIXES: tuple[str, ...] = (
+    "input_layernorm.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.k_norm.weight",
+)
+
+# The block-side key/value projections in split mode (the trainable copy).
+BLOCK_KV_SUFFIXES: tuple[str, ...] = (
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.k_norm.weight",
 )
 
 # Config fields that must match exactly for a weight copy to be meaningful.
@@ -235,24 +256,18 @@ def resolve_init_source_layers(
     return sources
 
 
-def copy_target_decoder_layers(
-    model: nn.Module,
-    verifier_path: str,
+def _copy_name_pairs(
     source_layers: list[int],
     *,
-    init_final_norm: bool = False,
-) -> list[str]:
-    """Initialise the draft decoder layers from target layers, all-or-nothing.
+    init_final_norm: bool,
+    include_context_kv: bool,
+) -> list[tuple[str, str]]:
+    """The (target key, draft param name) pairs a copy will move.
 
-    Reads only the needed tensors from the target's safetensors shards (via
-    the index file, on CPU), validates that every tensor exists and every
-    shape matches, and only then applies the copies. The fusion projection,
-    embedding, and LM head are never touched here (the embedding/head follow
-    DFlash's verifier sharing; the fusion follows ``fusion_init``).
-
-    :return: The state-dict names of the parameters that were copied.
-    :raises ValueError: if any tensor is missing or shaped differently; in
-        that case nothing is copied.
+    CONTEXT_KV_SUFFIXES are module-local (relative to the draft's
+    ``context_kv`` submodule); the target-side equivalents carry the
+    ``self_attn.`` prefix -- same tensors, same order, as
+    KV_PATH_SUFFIXES.
     """
     name_pairs: list[tuple[str, str]] = []  # (target key, draft param name)
     for draft_idx, source_idx in enumerate(source_layers):
@@ -263,8 +278,51 @@ def copy_target_decoder_layers(
                     f"layers.{draft_idx}.{suffix}",
                 )
             )
+        if include_context_kv:
+            for suffix, target_suffix in zip(
+                CONTEXT_KV_SUFFIXES, KV_PATH_SUFFIXES, strict=True
+            ):
+                name_pairs.append(
+                    (
+                        f"model.layers.{source_idx}.{target_suffix}",
+                        f"layers.{draft_idx}.self_attn.context_kv.{suffix}",
+                    )
+                )
     if init_final_norm:
         name_pairs.append(("model.norm.weight", "norm.weight"))
+    return name_pairs
+
+
+def copy_target_decoder_layers(
+    model: nn.Module,
+    verifier_path: str,
+    source_layers: list[int],
+    *,
+    init_final_norm: bool = False,
+    include_context_kv: bool = False,
+) -> list[str]:
+    """Initialise the draft decoder layers from target layers, all-or-nothing.
+
+    Reads only the needed tensors from the target's safetensors shards (via
+    the index file, on CPU), validates that every tensor exists and every
+    shape matches, and only then applies the copies. The fusion projection,
+    embedding, and LM head are never touched here (the embedding/head follow
+    DFlash's verifier sharing; the fusion follows ``fusion_init``).
+
+    With ``include_context_kv`` (dnest ``per_layer`` + ``split``), each
+    layer's frozen context path (``self_attn.context_kv``) is initialised
+    from the same source layer's key/value tensors, in the same
+    all-or-nothing transaction.
+
+    :return: The state-dict names of the parameters that were copied.
+    :raises ValueError: if any tensor is missing or shaped differently; in
+        that case nothing is copied.
+    """
+    name_pairs = _copy_name_pairs(
+        source_layers,
+        init_final_norm=init_final_norm,
+        include_context_kv=include_context_kv,
+    )
 
     # load_model_layers reads only the shards holding these tensors, on CPU,
     # via model.safetensors.index.json; missing names are omitted with a
