@@ -400,6 +400,13 @@ def test_random_mode_matches_dflash(target_dir):
         "fusion_init",
         "copied_lr_scale",
         "init_final_norm",
+        # per-layer context knobs (fused mode keeps DFlash defaults there)
+        "context_mode",
+        "kv_mode",
+        "lr_scale_new",
+        "lr_scale_copied",
+        "lr_scale_context_kv",
+        "lr_scale_block_kv",
     }
     for key in set(dnest_dict) - dnest_only:
         assert dnest_dict[key] == dflash_dict.get(key), key
@@ -500,9 +507,13 @@ def test_optimizer_lr_groups_through_ddp_wrapper(target_dir, tmp_path):
         assert lrs == {1e-3, 1e-4}
         scaled = [g for g in optimizer.param_groups if abs(g["lr"] - 1e-4) < 1e-12]
         assert len(scaled[0]["params"]) == 2 * len(COPIED_LAYER_SUFFIXES)
-        # the optimizer holds the wrapped module's tensors, not copies
+        # the optimizer holds the wrapped module's trainable tensors, not
+        # copies -- frozen parameters (verifier-shared weights) are excluded
+        # entirely and carry no optimizer state
         opt_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
-        assert opt_ids == {id(p) for p in model.parameters()}
+        assert opt_ids == {
+            id(p) for p in model.parameters() if p.requires_grad
+        }
     finally:
         dist.destroy_process_group()
 
