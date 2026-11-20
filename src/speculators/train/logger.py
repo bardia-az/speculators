@@ -320,9 +320,9 @@ class TensorBoardHandler(logging.Handler):
     def _scalarise(d: dict) -> dict:
         """Convert non-scalar values to JSON strings for TensorBoard compatibility.
 
-        TensorBoard's add_hparams only accepts int, float, str, bool, and torch.Tensor.
-        This method converts lists and dicts to JSON strings so all backends can
-        receive the full config.
+        The HPARAMS plugin only accepts int, float, str, bool, None, and
+        torch.Tensor. This method converts lists and dicts to JSON strings so
+        the full config can be recorded.
 
         Args:
             d: Dictionary potentially containing non-scalar values
@@ -363,9 +363,19 @@ class TensorBoardHandler(logging.Handler):
         if getattr(record, "hparams", None):
             # Convert non-scalar values to JSON strings for TensorBoard compatibility
             scalarised_dict = self._scalarise(flat_dict)
-            self._tboard_writer.add_hparams(
-                scalarised_dict, {}, run_name=".", global_step=step
-            )
+            # Write the HPARAMS session protos through the main writer's single
+            # event file (the technique PyTorch Lightning's TensorBoardLogger
+            # uses for log_hyperparams). SummaryWriter.add_hparams() instead
+            # opens a second SummaryWriter in the same directory — with
+            # run_name="." it resolves back to this log_dir — and TensorBoard's
+            # directory watcher stops live-reloading a run once an older event
+            # file keeps growing after a newer one appeared.
+            from torch.utils.tensorboard.summary import hparams  # noqa: PLC0415
+
+            exp, ssi, sei = hparams(scalarised_dict, {})
+            self._tboard_writer.file_writer.add_summary(exp, step)
+            self._tboard_writer.file_writer.add_summary(ssi, step)
+            self._tboard_writer.file_writer.add_summary(sei, step)
             return
 
         for k, v in flat_dict.items():
