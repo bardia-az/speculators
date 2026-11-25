@@ -17,6 +17,9 @@ at the context tokens' absolute positions. No target KV cache is needed.
 - ``split`` — a second, frozen copy of the four path tensors lives on the
   attention as ``self_attn.context_kv``; the block keeps the layer's own
   (trainable) path.
+- ``split_trainable`` — the same second copy, but trainable: it starts as
+  the source layer's exact path (context keys/values equal the target's at
+  initialisation) and may then drift during training.
 """
 
 import torch
@@ -35,9 +38,10 @@ __all__ = [
     "DNestDecoderLayer",
 ]
 
-# State-dict suffixes of the frozen context path in ``split`` mode, relative
-# to the attention module (``layers.{j}.self_attn.context_kv.<suffix>``).
-# They copy 1:1 from the target layer (``model.layers.{s}.<suffix>``).
+# State-dict suffixes of the context path in ``split``/``split_trainable``
+# mode, relative to the attention module
+# (``layers.{j}.self_attn.context_kv.<suffix>``). They copy 1:1 from the
+# target layer (``model.layers.{s}.<suffix>``).
 CONTEXT_KV_SUFFIXES: tuple[str, ...] = (
     "input_layernorm.weight",
     "k_proj.weight",
@@ -47,13 +51,13 @@ CONTEXT_KV_SUFFIXES: tuple[str, ...] = (
 
 
 class ContextKVPath(nn.Module):
-    """The frozen per-layer context key/value path (``split`` mode).
+    """The per-layer context key/value path (``split``/``split_trainable``).
 
     Mirrors the target layer's key/value computation: ``input_layernorm``
     feeding ``k_proj``/``v_proj``, and the per-head ``k_norm`` for keys. All
     four tensors are copied from the source target layer at fresh
-    initialisation and frozen (``requires_grad=False``), so the context
-    keys/values are exactly the target's.
+    initialisation; ``split`` then freezes them (context keys/values exactly
+    the target's), ``split_trainable`` keeps them trainable.
     """
 
     def __init__(self, config: Qwen3Config):

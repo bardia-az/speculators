@@ -83,7 +83,7 @@ class DNestDraftModel(DFlashDraftModel):
         return DNestDecoderLayer(
             config.transformer_layer_config,  # type: ignore[arg-type]
             layer_idx,
-            split=config.kv_mode == "split",
+            split=config.kv_mode in ("split", "split_trainable"),
         )
 
     def _context_features(self, hidden_states: torch.Tensor) -> list[torch.Tensor]:
@@ -137,7 +137,7 @@ class DNestDraftModel(DFlashDraftModel):
                 for j in range(len(self.layers))
                 for suffix in CONTEXT_KV_SUFFIXES
             ]
-        else:  # trainable_shared: nothing frozen
+        else:  # trainable modes (split_trainable, trainable_shared): nothing frozen
             return
         for name in names:
             self.get_parameter(name).requires_grad_(False)
@@ -256,7 +256,8 @@ class DNestDraftModel(DFlashDraftModel):
                     source_layers,
                     init_final_norm=init_final_norm,
                     include_context_kv=(
-                        context_mode == "per_layer" and kv_mode == "split"
+                        context_mode == "per_layer"
+                        and kv_mode in ("split", "split_trainable")
                     ),
                 )
             )
@@ -276,7 +277,8 @@ class DNestDraftModel(DFlashDraftModel):
 
         per_layer mode groups by role: the key/value path per ``kv_mode``
         (shared path at ``lr_scale_context_kv``; the split block path at
-        ``lr_scale_block_kv``), the remaining copied weights at
+        ``lr_scale_block_kv``; the split_trainable context copy at
+        ``lr_scale_context_kv``), the remaining copied weights at
         ``lr_scale_copied``, and non-copied trainable parameters (the draft
         final norm when not target-initialised; every layer parameter in
         random mode) at ``lr_scale_new``. Frozen tensors are absent: they
@@ -311,6 +313,16 @@ class DNestDraftModel(DFlashDraftModel):
         num_draft_layers = config.transformer_layer_config.num_hidden_layers
         for draft_idx in range(num_draft_layers):
             prefix = f"layers.{draft_idx}."
+            if config.kv_mode == "split_trainable":
+                # The context_kv path is always trainable and always carries
+                # lr_scale_context_kv -- copied from the source layer with a
+                # target init, randomly initialised with init_mode='random'
+                # -- unlike split, where it is frozen and never reaches an
+                # optimizer.
+                for suffix in CONTEXT_KV_SUFFIXES:
+                    scales[f"{prefix}self_attn.context_kv.{suffix}"] = (
+                        config.lr_scale_context_kv
+                    )
             if config.init_mode == "random":
                 # Nothing is copied: every layer parameter is new.
                 for suffix in COPIED_LAYER_SUFFIXES:
@@ -319,7 +331,7 @@ class DNestDraftModel(DFlashDraftModel):
             for suffix in COPIED_LAYER_SUFFIXES:
                 if config.kv_mode == "frozen_shared" and suffix in kv_path:
                     continue  # frozen: excluded from the optimizer entirely
-                if config.kv_mode == "split":
+                if config.kv_mode in ("split", "split_trainable"):
                     scales[prefix + suffix] = (
                         config.lr_scale_block_kv
                         if suffix in block_kv
