@@ -645,14 +645,20 @@ class DNestArgs(_Group):
         "coincide automatically for target_after_extracted).",
     )
     kv_mode: (
-        Literal["frozen_shared", "split", "trainable_shared"] | None
+        Literal[
+            "frozen_shared", "split", "split_trainable", "trainable_shared"
+        ]
+        | None
     ) = Field(
         default=None,
         description="Ownership of the per-layer key/value path "
         "(--context-mode per_layer only): 'frozen_shared' (one path, frozen, "
         "context keys/values exactly the target's), 'split' (frozen context "
-        "path + trainable block path), or 'trainable_shared' (one shared "
-        "trainable path; the only mode allowed with --init-mode random).",
+        "path + trainable block path), 'split_trainable' (like 'split', but "
+        "the context copy is trainable too -- context keys/values may drift "
+        "from the target's; also accepts --init-mode random), or "
+        "'trainable_shared' (one shared trainable path; also accepts "
+        "--init-mode random).",
     )
     lr_scale_new: float | None = Field(
         default=None,
@@ -665,22 +671,23 @@ class DNestArgs(_Group):
         ge=0.0,
         description="Learning-rate multiplier for copied weights outside the "
         "key/value paths (q_proj, o_proj, q_norm, post_attention_layernorm, "
-        "MLP, and in 'split' the block path's input_layernorm). Same knob as "
-        "--copied-lr-scale (the old name still works); in fused context mode "
-        "it scales the whole layer copy.",
+        "MLP, and in 'split'/'split_trainable' the block path's "
+        "input_layernorm). Same knob as --copied-lr-scale (the old name "
+        "still works); in fused context mode it scales the whole layer copy.",
     )
     lr_scale_context_kv: float | None = Field(
         default=None,
         ge=0.0,
-        description="Learning-rate multiplier for the shared key/value path "
-        "(input_layernorm + k_proj + v_proj + k_norm); kv_mode "
-        "'trainable_shared' only.",
+        description="Learning-rate multiplier for the trainable context "
+        "key/value path (input_layernorm + k_proj + v_proj + k_norm): the "
+        "shared path in kv_mode 'trainable_shared', the context_kv copy in "
+        "'split_trainable'.",
     )
     lr_scale_block_kv: float | None = Field(
         default=None,
         ge=0.0,
         description="Learning-rate multiplier for the block key/value path "
-        "(k_proj + v_proj + k_norm); kv_mode 'split' only.",
+        "(k_proj + v_proj + k_norm); kv_mode 'split'/'split_trainable' only.",
     )
 
 
