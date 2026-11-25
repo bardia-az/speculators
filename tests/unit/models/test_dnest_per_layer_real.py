@@ -128,10 +128,13 @@ def test_real_tap_is_the_input_of_its_consumer_layer(target_model):
         )
 
 
-@pytest.mark.parametrize("kv_mode", ["frozen_shared", "split", "trainable_shared"])
+@pytest.mark.parametrize(
+    "kv_mode", ["frozen_shared", "split", "split_trainable", "trainable_shared"]
+)
 def test_real_context_kv_equals_target_cache(kv_mode, target_forward):
     """Per-layer context K/V through real copied weights == the real target's
-    own cache at layer s_j (post k_norm, post RoPE for keys)."""
+    own cache at layer s_j (post k_norm, post RoPE for keys). The trainable
+    modes (split_trainable, trainable_shared) hold at initialisation."""
     from speculators.models.dflash.model_definitions import (
         apply_rotary_pos_emb,
     )

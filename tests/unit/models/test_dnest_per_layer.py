@@ -135,15 +135,18 @@ def test_tap_is_the_input_of_its_consumer_layer(target_dir):
 # --- 2. exact context keys/values -------------------------------------------
 
 
-@pytest.mark.parametrize("kv_mode", ["frozen_shared", "split", "trainable_shared"])
+@pytest.mark.parametrize(
+    "kv_mode", ["frozen_shared", "split", "split_trainable", "trainable_shared"]
+)
 def test_context_kv_equals_target_cache(target_dir, kv_mode):
     """The per-layer context K/V path reproduces the target's own cache.
 
     For every draft layer j (source s_j): context K == target cache keys at
     layer s_j (post k_norm, post RoPE) and context V == target cache values,
     within float tolerance; the frozen modes hold exactly (copied weights),
-    trainable_shared holds at initialisation. RoPE is applied at the context
-    tokens' absolute positions on both sides.
+    the trainable modes (split_trainable, trainable_shared) hold at
+    initialisation. RoPE is applied at the context tokens' absolute
+    positions on both sides.
     """
     target, path = target_dir
     ids, out = _target_forward(target)
@@ -318,21 +321,32 @@ def test_frozen_tensors_never_move(target_dir, kv_mode):
         assert id(model.get_parameter(name)) not in state_param_ids
 
 
+@pytest.mark.parametrize(
+    "kv_mode,init_mode",
+    [
+        ("split", "target_after_extracted"),
+        ("split_trainable", "target_after_extracted"),
+        ("split_trainable", "random"),
+    ],
+)
 def test_per_layer_roundtrip_preserves_config_weights_and_freezing(
-    target_dir, tmp_path
+    target_dir, tmp_path, kv_mode, init_mode
 ):
     """save_pretrained -> from_pretrained: the per-layer config round-trips,
-    the frozen context tensors are bit-identical and re-frozen, and the
-    optimizer LR groups are rebuilt identically (resume identity)."""
+    the context tensors are bit-identical, re-frozen exactly in split mode
+    (and trainable after load in split_trainable), and the optimizer LR
+    groups are rebuilt identically (resume identity)."""
     from speculators.model import SpeculatorModel
 
     _, path = target_dir
     model = _build_per_layer(
         path,
-        kv_mode="split",
+        kv_mode=kv_mode,
+        init_mode=init_mode,
         lr_scale_new=0.5,
         lr_scale_copied=0.1,
         lr_scale_block_kv=0.2,
+        **({"lr_scale_context_kv": 0.15} if kv_mode == "split_trainable" else {}),
     )
     ctx_before = {
         f"layers.{j}.self_attn.context_kv.{suffix}"
@@ -344,30 +358,37 @@ def test_per_layer_roundtrip_preserves_config_weights_and_freezing(
     }
     scales_before = model.optimizer_param_lr_scales()
 
-    save_dir = tmp_path / "perlayer-roundtrip"
+    save_dir = tmp_path / f"perlayer-roundtrip-{kv_mode}"
     model.save_pretrained(save_dir)
     reloaded = SpeculatorModel.from_pretrained(str(save_dir))
 
     assert reloaded.config.context_mode == "per_layer"
-    assert reloaded.config.kv_mode == "split"
+    assert reloaded.config.kv_mode == kv_mode
     assert reloaded.config.lr_scale_block_kv == 0.2
     for name, before in weights_before.items():
         after = reloaded.get_parameter(name).detach()
         assert torch.equal(before, after), f"{name} changed across save/load"
-        assert not reloaded.get_parameter(name).requires_grad, (
-            f"{name} not re-frozen after load"
-        )
+        if kv_mode == "split":
+            assert not reloaded.get_parameter(name).requires_grad, (
+                f"{name} not re-frozen after load"
+            )
+        else:
+            assert reloaded.get_parameter(name).requires_grad, (
+                f"{name} frozen after load in split_trainable mode"
+            )
     assert reloaded.optimizer_param_lr_scales() == scales_before
 
 
 # --- 4. split separation ----------------------------------------------------
 
 
-def test_split_paths_start_equal_then_diverge(target_dir):
-    """split: context and block paths start as the same target copy; after
-    steps, the block path moved and the context path did not."""
+@pytest.mark.parametrize("kv_mode", ["split", "split_trainable"])
+def test_split_paths_start_equal_then_diverge(target_dir, kv_mode):
+    """split family: context and block paths start as the same target copy;
+    after steps they diverge -- the block path always moves, the context
+    path only in split_trainable (frozen in split)."""
     _, path = target_dir
-    model = _build_per_layer(path, kv_mode="split")
+    model = _build_per_layer(path, kv_mode=kv_mode)
     model.train()
 
     for j in range(2):
@@ -425,15 +446,84 @@ def test_split_paths_start_equal_then_diverge(target_dir):
         optimizer.step()
 
     for name, before in ctx_before.items():
-        assert torch.equal(
-            before, model.get_parameter(name).detach()
-        ), f"{name} (context path) moved in split mode"
+        if kv_mode == "split":
+            assert torch.equal(
+                before, model.get_parameter(name).detach()
+            ), f"{name} (context path) moved in split mode"
+    ctx_moved = [
+        name
+        for name, before in ctx_before.items()
+        if not torch.equal(before, model.get_parameter(name).detach())
+    ]
+    if kv_mode == "split_trainable":
+        assert ctx_moved, "no context-path tensor changed in split_trainable"
+    else:
+        assert not ctx_moved
     moved = [
         name
         for name, before in blk_before.items()
         if not torch.equal(before, model.get_parameter(name).detach())
     ]
     assert moved, "no block-path tensor changed in split mode"
+
+
+def test_random_split_trainable_context_moves(target_dir):
+    """random init: the context path has no target copy to pin to -- it
+    must be trainable and actually move under optimizer steps, with only
+    the verifier-shared tensors frozen."""
+    _, path = target_dir
+    model = _build_per_layer(path, kv_mode="split_trainable", init_mode="random")
+    model.train()
+
+    ctx_names = [
+        f"layers.{j}.self_attn.context_kv.{s}"
+        for j in range(2)
+        for s in CONTEXT_KV_SUFFIXES
+    ]
+    assert all(model.get_parameter(n).requires_grad for n in ctx_names)
+    frozen = [
+        n for n, p in model.named_parameters() if not p.requires_grad
+    ]
+    assert sorted(frozen) == [
+        "embed_tokens.weight",
+        "lm_head.weight",
+        "verifier_lm_head.weight",
+        "verifier_norm.weight",
+    ]
+    ctx_before = {
+        n: model.get_parameter(n).detach().clone() for n in ctx_names
+    }
+
+    config = SimpleNamespace(optimizer="adamw", lr=1e-2, weight_decay=0.0)
+    optimizer = build_optimizers(model, config)[0]
+    torch.manual_seed(9)
+    batch = build_batch()
+    batch["hidden_states"] = torch.randn(1, 24, 2 * 64)
+    batch["verifier_last_hidden_states"] = torch.randn(1, 24, 64)
+    from speculators.models.dflash.metrics import compute_metrics
+
+    for _ in range(3):
+        hidden, logits, targets, aligned_loss_mask, block_idx = (
+            model._backbone_forward(max_anchors=8, **batch)  # noqa: SLF001
+        )
+        loss, _ = compute_metrics(
+            logits, targets, aligned_loss_mask, model.block_size,
+            gamma=4.0, loss_config=resolve_loss_config("ce", "eager"),
+            per_position_loss_weight="fixed-exp-decay", dpace_alpha=0.5,
+            sample_from_anchor=model.config.sample_from_anchor,
+            token_ids=batch["input_ids"][:, block_idx],
+            target_temperature=1.0, t2d=None, loss_implementation="eager",
+        )
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    moved = [
+        n
+        for n, before in ctx_before.items()
+        if not torch.equal(before, model.get_parameter(n).detach())
+    ]
+    assert moved, "no context-path tensor moved in random split_trainable"
 
 
 # --- 5. learning-rate groups ------------------------------------------------
@@ -516,6 +606,49 @@ def test_lr_groups_split(target_dir):
     )
 
 
+def test_lr_groups_split_trainable(target_dir):
+    """split_trainable adds the trainable context copy: the context_kv
+    tensors carry lr_scale_context_kv, the block path lr_scale_block_kv,
+    and the block path's input_layernorm stays in the copied group."""
+    _, path = target_dir
+    model = _build_per_layer(
+        path,
+        kv_mode="split_trainable",
+        lr_scale_copied=0.5,
+        lr_scale_block_kv=0.2,
+        lr_scale_context_kv=0.1,
+        lr_scale_new=0.25,
+    )
+    base, scaled = _lr_groups(model)
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    ctx_expected = {
+        f"layers.{j}.self_attn.context_kv.{s}"
+        for j in range(2)
+        for s in CONTEXT_KV_SUFFIXES
+    }
+    block_expected = {
+        f"layers.{j}.{s}"
+        for j in range(2)
+        for s in BLOCK_KV_SUFFIXES
+    }
+    # the block path's input_layernorm is copied-group, not block_kv
+    copied_expected = {
+        f"layers.{j}.{s}"
+        for j in range(2)
+        for s in COPIED_LAYER_SUFFIXES
+        if s not in BLOCK_KV_SUFFIXES
+    }
+    assert set(scaled) == {0.1, 0.2, 0.5, 0.25}
+    assert scaled[0.1] == ctx_expected
+    assert scaled[0.2] == block_expected
+    assert scaled[0.5] == copied_expected
+    assert scaled[0.25] == {"norm.weight"}
+    assert base == set()
+    assert trainable == ctx_expected | block_expected | copied_expected | {
+        "norm.weight"
+    }
+
+
 def test_lr_groups_trainable_shared(target_dir):
     _, path = target_dir
     model = _build_per_layer(
@@ -559,17 +692,49 @@ def test_lr_groups_random_baseline_all_new(target_dir):
     assert base == set()
 
 
-def test_split_by_lr_scale_partitions_trainable(target_dir):
+def test_lr_groups_random_split_trainable(target_dir):
+    """random + split_trainable: everything is new except the context path,
+    which keeps its role scale -- one knob, one meaning across init modes."""
+    _, path = target_dir
+    model = _build_per_layer(
+        path,
+        kv_mode="split_trainable",
+        init_mode="random",
+        lr_scale_new=0.3,
+        lr_scale_context_kv=0.15,
+    )
+    base, scaled = _lr_groups(model)
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+    ctx_expected = {
+        f"layers.{j}.self_attn.context_kv.{s}"
+        for j in range(2)
+        for s in CONTEXT_KV_SUFFIXES
+    }
+    new_expected = {
+        f"layers.{j}.{s}"
+        for j in range(2)
+        for s in COPIED_LAYER_SUFFIXES
+    } | {"norm.weight"}
+    assert set(scaled) == {0.3, 0.15}
+    assert scaled[0.15] == ctx_expected
+    assert scaled[0.3] == new_expected
+    assert base == set()
+    assert trainable == ctx_expected | new_expected
+
+
+@pytest.mark.parametrize("kv_mode", ["split", "split_trainable"])
+def test_split_by_lr_scale_partitions_trainable(target_dir, kv_mode):
     """The optimizer-side partition agrees with the config-derived scales:
     every trainable tensor lands in exactly its scale's group, nothing is
     lost or duplicated, and base holds only tensors without a scale."""
     _, path = target_dir
     model = _build_per_layer(
         path,
-        kv_mode="split",
+        kv_mode=kv_mode,
         lr_scale_copied=0.5,
         lr_scale_block_kv=0.2,
         lr_scale_new=0.25,
+        **({"lr_scale_context_kv": 0.1} if kv_mode == "split_trainable" else {}),
     )
     scales = model.optimizer_param_lr_scales()
     base, scaled = split_by_lr_scale(
@@ -587,7 +752,7 @@ def test_split_by_lr_scale_partitions_trainable(target_dir):
             assert scales[name_by_id[id(p)]] == scale
     for p in base:
         assert name_by_id[id(p)] not in scales
-    # in split mode every trainable tensor has a scale, so base is empty
+    # in the split family every trainable tensor has a scale: base is empty
     assert base == []
 
 
@@ -610,7 +775,8 @@ def test_muon_split_routes_frozen_out_of_both_optimizers(target_dir):
 @pytest.mark.parametrize(
     "kwargs,needle",
     [
-        # frozen modes need target weights
+        # frozen context modes need target weights (trainable ones accept
+        # random: frozen_shared/split + random -> error)
         (
             dict(context_mode="per_layer", kv_mode="frozen_shared",
                  init_mode="random"),
@@ -623,6 +789,10 @@ def test_muon_split_routes_frozen_out_of_both_optimizers(target_dir):
         # per-layer knobs rejected in fused mode (by value)
         (
             dict(context_mode="fused", kv_mode="split"),
+            "only apply with",
+        ),
+        (
+            dict(context_mode="fused", kv_mode="split_trainable"),
             "only apply with",
         ),
         (
@@ -813,6 +983,8 @@ def test_fused_regression_golden(tmp_path):
     [
         ("frozen_shared", "target_after_extracted"),
         ("split", "target_after_extracted"),
+        ("split_trainable", "target_after_extracted"),
+        ("split_trainable", "random"),
         ("trainable_shared", "target_after_extracted"),
         ("trainable_shared", "random"),
     ],
