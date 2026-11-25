@@ -49,7 +49,8 @@ COPIED_LAYER_SUFFIXES: tuple[str, ...] = (
 # The key/value path inside a copied layer (layer-level suffixes, a subset
 # of COPIED_LAYER_SUFFIXES): input_layernorm feeding k/v_proj, plus k_norm.
 # dnest's per_layer context mode computes the context keys/values with
-# exactly these tensors (shared kv_modes) or a frozen copy of them (split).
+# exactly these tensors (shared kv_modes) or a copy of them living on the
+# attention as context_kv (split: frozen, split_trainable: trainable).
 KV_PATH_SUFFIXES: tuple[str, ...] = (
     "input_layernorm.weight",
     "self_attn.k_proj.weight",
@@ -57,7 +58,8 @@ KV_PATH_SUFFIXES: tuple[str, ...] = (
     "self_attn.k_norm.weight",
 )
 
-# The block-side key/value projections in split mode (the trainable copy).
+# The block-side key/value projections in split/split_trainable mode (the
+# trainable copy).
 BLOCK_KV_SUFFIXES: tuple[str, ...] = (
     "self_attn.k_proj.weight",
     "self_attn.v_proj.weight",

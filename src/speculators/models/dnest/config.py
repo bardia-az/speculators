@@ -121,7 +121,9 @@ class DNestSpeculatorConfig(DFlashSpeculatorConfig):
             "for who owns that path."
         ),
     )
-    kv_mode: Literal["frozen_shared", "split", "trainable_shared"] = Field(
+    kv_mode: Literal[
+        "frozen_shared", "split", "split_trainable", "trainable_shared"
+    ] = Field(
         default="frozen_shared",
         description=(
             "Ownership/trainability of the per-layer key/value path "
@@ -130,8 +132,13 @@ class DNestSpeculatorConfig(DFlashSpeculatorConfig):
             "frozen, used for both context and block -- context keys/values "
             "are exactly the target's. 'split': two paths; the context path "
             "(self_attn.context_kv) is a frozen copy, the block path is "
-            "trainable. 'trainable_shared': one shared, trainable path. "
-            "Frozen modes require a target-derived init_mode."
+            "trainable. 'split_trainable': like 'split', but the context "
+            "copy is trainable too (lr_scale_context_kv), so context "
+            "keys/values may drift from the target's; random init is also "
+            "accepted (the context path is then randomly initialised). "
+            "'trainable_shared': one shared, trainable path. The frozen "
+            "modes (frozen_shared, split) require a target-derived "
+            "init_mode."
         ),
     )
     lr_scale_new: float = Field(
@@ -152,7 +159,8 @@ class DNestSpeculatorConfig(DFlashSpeculatorConfig):
         description=(
             "Learning-rate multiplier for copied weights outside the "
             "key/value paths (q_proj, o_proj, q_norm, post_attention_layernorm, "
-            "MLP, and in 'split' the block path's input_layernorm). "
+            "MLP, and in 'split'/'split_trainable' the block path's "
+            "input_layernorm). "
             "copied_lr_scale is the backward-compatible alias; both names "
             "are kept equal on saved configs. Also the active field in "
             "fused context mode (where the whole layer copy is scaled, as "
@@ -163,9 +171,10 @@ class DNestSpeculatorConfig(DFlashSpeculatorConfig):
         default=1.0,
         ge=0.0,
         description=(
-            "Learning-rate multiplier for the shared key/value path, "
-            "kv_mode 'trainable_shared' only (input_layernorm + k_proj + "
-            "v_proj + k_norm)."
+            "Learning-rate multiplier for the trainable context key/value "
+            "path (input_layernorm + k_proj + v_proj + k_norm): the shared "
+            "path in kv_mode 'trainable_shared', the context_kv copy in "
+            "'split_trainable'."
         ),
     )
     lr_scale_block_kv: float = Field(
@@ -173,7 +182,8 @@ class DNestSpeculatorConfig(DFlashSpeculatorConfig):
         ge=0.0,
         description=(
             "Learning-rate multiplier for the block key/value path "
-            "(k_proj + v_proj + k_norm), kv_mode 'split' only."
+            "(k_proj + v_proj + k_norm), kv_mode 'split'/'split_trainable' "
+            "only."
         ),
     )
 
@@ -244,14 +254,19 @@ class DNestSpeculatorConfig(DFlashSpeculatorConfig):
             raise ValueError(
                 f"kv_mode='{self.kv_mode}' freezes a context key/value path "
                 "copied from the target, which requires a target-derived "
-                "init_mode. For the per-layer ablation without target "
-                "weights use kv_mode='trainable_shared'."
+                "init_mode. For a per-layer ablation without target weights "
+                "use kv_mode='trainable_shared' or 'split_trainable' (a "
+                "trainable context path may also start from random init)."
             )
-        if self.kv_mode != "trainable_shared" and self.lr_scale_context_kv != 1.0:
+        if (
+            self.kv_mode not in ("trainable_shared", "split_trainable")
+            and self.lr_scale_context_kv != 1.0
+        ):
             raise ValueError(
-                "lr_scale_context_kv scales the shared key/value path and "
-                f"only applies with kv_mode='trainable_shared' (got "
-                f"kv_mode='{self.kv_mode}'; the path is "
+                "lr_scale_context_kv scales the trainable context key/value "
+                "path and only applies with kv_mode='trainable_shared' or "
+                f"'split_trainable' (got kv_mode='{self.kv_mode}'; the path "
+                "is "
                 + (
                     "frozen, not optimized"
                     if self.kv_mode == "frozen_shared"
@@ -259,10 +274,14 @@ class DNestSpeculatorConfig(DFlashSpeculatorConfig):
                 )
                 + ")."
             )
-        if self.kv_mode != "split" and self.lr_scale_block_kv != 1.0:
+        if (
+            self.kv_mode not in ("split", "split_trainable")
+            and self.lr_scale_block_kv != 1.0
+        ):
             raise ValueError(
                 "lr_scale_block_kv scales the block key/value path and only "
-                f"applies with kv_mode='split' (got kv_mode='{self.kv_mode}')."
+                "applies with kv_mode='split' or 'split_trainable' (got "
+                f"kv_mode='{self.kv_mode}')."
             )
         if self.fusion_init == "passthrough_deepest":
             raise ValueError(
