@@ -148,7 +148,8 @@ class DNestSpeculatorConfig(DFlashSpeculatorConfig):
             "Learning-rate multiplier for newly created (non-copied, "
             "trainable) parameters. In per_layer mode with a target init "
             "this is typically only the draft final norm; with init_mode "
-            "'random' it covers every layer parameter. Frozen parameters are "
+            "'random' it covers layer weights outside the dedicated key/value "
+            "groups. Frozen parameters are "
             "excluded from the optimizer entirely (requires_grad=False), "
             "never 'frozen' with a zero scale."
         ),

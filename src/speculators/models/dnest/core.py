@@ -280,8 +280,8 @@ class DNestDraftModel(DFlashDraftModel):
         ``lr_scale_block_kv``; the split_trainable context copy at
         ``lr_scale_context_kv``), the remaining copied weights at
         ``lr_scale_copied``, and non-copied trainable parameters (the draft
-        final norm when not target-initialised; every layer parameter in
-        random mode) at ``lr_scale_new``. Frozen tensors are absent: they
+        final norm when not target-initialised and random weights outside
+        the dedicated KV groups) at ``lr_scale_new``. Frozen tensors are absent: they
         are ``requires_grad=False`` and never reach an optimizer.
 
         Derived purely from the saved config -- not from runtime state -- so
@@ -309,6 +309,9 @@ class DNestDraftModel(DFlashDraftModel):
     ) -> dict[str, float]:
         kv_path = set(KV_PATH_SUFFIXES)
         block_kv = set(BLOCK_KV_SUFFIXES)
+        layer_scale = (
+            config.lr_scale_new if config.init_mode == "random" else config.lr_scale_copied
+        )
         scales: dict[str, float] = {}
         num_draft_layers = config.transformer_layer_config.num_hidden_layers
         for draft_idx in range(num_draft_layers):
@@ -323,24 +326,15 @@ class DNestDraftModel(DFlashDraftModel):
                     scales[f"{prefix}self_attn.context_kv.{suffix}"] = (
                         config.lr_scale_context_kv
                     )
-            if config.init_mode == "random":
-                # Nothing is copied: every layer parameter is new.
-                for suffix in COPIED_LAYER_SUFFIXES:
-                    scales[prefix + suffix] = config.lr_scale_new
-                continue
             for suffix in COPIED_LAYER_SUFFIXES:
                 if config.kv_mode == "frozen_shared" and suffix in kv_path:
                     continue  # frozen: excluded from the optimizer entirely
-                if config.kv_mode in ("split", "split_trainable"):
-                    scales[prefix + suffix] = (
-                        config.lr_scale_block_kv
-                        if suffix in block_kv
-                        else config.lr_scale_copied
-                    )
+                if config.kv_mode in ("split", "split_trainable") and suffix in block_kv:
+                    scales[prefix + suffix] = config.lr_scale_block_kv
                 elif config.kv_mode == "trainable_shared" and suffix in kv_path:
                     scales[prefix + suffix] = config.lr_scale_context_kv
                 else:
-                    scales[prefix + suffix] = config.lr_scale_copied
+                    scales[prefix + suffix] = layer_scale
         scales["norm.weight"] = (
             config.lr_scale_copied
             if config.init_final_norm

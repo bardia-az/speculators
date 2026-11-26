@@ -679,47 +679,36 @@ def test_lr_groups_trainable_shared(target_dir):
     assert trainable == kv_expected | copied_expected | {"norm.weight"}
 
 
-def test_lr_groups_random_baseline_all_new(target_dir):
+@pytest.mark.parametrize("kv_mode", ["trainable_shared", "split_trainable"])
+@pytest.mark.parametrize("set_kv_scales", [False, True])
+def test_random_optimizer_kv_learning_rates(target_dir, kv_mode, set_kv_scales):
     _, path = target_dir
+    kv_scales = {}
+    if set_kv_scales:
+        kv_scales["lr_scale_context_kv"] = 0.15
+        if kv_mode == "split_trainable":
+            kv_scales["lr_scale_block_kv"] = 0.2
     model = _build_per_layer(
-        path, kv_mode="trainable_shared", init_mode="random", lr_scale_new=0.3
+        path, kv_mode=kv_mode, init_mode="random", lr_scale_new=0.3, **kv_scales
     )
-    base, scaled = _lr_groups(model)
-    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
-    new_expected = trainable  # every trainable parameter is new in random mode
-    assert set(scaled) == {0.3}
-    assert scaled[0.3] == new_expected
-    assert base == set()
-
-
-def test_lr_groups_random_split_trainable(target_dir):
-    """random + split_trainable: everything is new except the context path,
-    which keeps its role scale -- one knob, one meaning across init modes."""
-    _, path = target_dir
-    model = _build_per_layer(
-        path,
-        kv_mode="split_trainable",
-        init_mode="random",
-        lr_scale_new=0.3,
-        lr_scale_context_kv=0.15,
-    )
-    base, scaled = _lr_groups(model)
-    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
-    ctx_expected = {
-        f"layers.{j}.self_attn.context_kv.{s}"
-        for j in range(2)
-        for s in CONTEXT_KV_SUFFIXES
-    }
-    new_expected = {
-        f"layers.{j}.{s}"
-        for j in range(2)
-        for s in COPIED_LAYER_SUFFIXES
-    } | {"norm.weight"}
-    assert set(scaled) == {0.3, 0.15}
-    assert scaled[0.15] == ctx_expected
-    assert scaled[0.3] == new_expected
-    assert base == set()
-    assert trainable == ctx_expected | new_expected
+    config = SimpleNamespace(optimizer="adamw", lr=1e-3, weight_decay=0.0)
+    optimizer = build_optimizers(model, config)[0]
+    actual = {id(p): g["lr"] for g in optimizer.param_groups for p in g["params"]}
+    expected = {name: 0.3 for name, p in model.named_parameters() if p.requires_grad}
+    context_scale = kv_scales.get("lr_scale_context_kv", 1.0)
+    for layer in range(2):
+        prefix = f"layers.{layer}."
+        if kv_mode == "trainable_shared":
+            for suffix in KV_PATH_SUFFIXES:
+                expected[prefix + suffix] = context_scale
+        else:
+            for suffix in CONTEXT_KV_SUFFIXES:
+                expected[prefix + "self_attn.context_kv." + suffix] = context_scale
+            for suffix in BLOCK_KV_SUFFIXES:
+                expected[prefix + suffix] = kv_scales.get("lr_scale_block_kv", 1.0)
+    assert len(actual) == len(expected)
+    for name, scale in expected.items():
+        assert actual[id(model.get_parameter(name))] == pytest.approx(config.lr * scale), name
 
 
 @pytest.mark.parametrize("kv_mode", ["split", "split_trainable"])
