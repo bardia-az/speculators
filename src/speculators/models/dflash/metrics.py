@@ -74,6 +74,11 @@ def _tau_rb_term(
     """
     if "tau_rb" not in loss_config:
         return None, None
+    if t2d is not None:
+        raise ValueError(
+            "tau_rb training requires the full verifier vocabulary. The reduced "
+            "verifier head omits probability mass outside the draft vocabulary."
+        )
     if loss_implementation not in ("fused", "eager"):
         raise ValueError(
             f"Unknown loss implementation '{loss_implementation}'. Choose "
@@ -92,7 +97,6 @@ def _tau_rb_term(
         loss_mask,
         block_size,
         temperature=target_temperature,
-        t2d=t2d,
         sample_from_anchor=sample_from_anchor,
     )
 
@@ -129,8 +133,8 @@ def compute_metrics(
         token_ids: Realized training tokens at each slot (verifier vocab),
             required by the ``tau_rb`` loss
         target_temperature: Temperature forming ``p`` for the ``tau_rb`` loss
-        t2d: Target-to-draft vocab mapping for the ``tau_rb`` loss, or None
-            when the draft uses the full vocabulary
+        t2d: Reduced-vocabulary membership mask, or None for the full
+            verifier vocabulary required by ``tau_rb`` training.
         loss_implementation: Which ``tau_rb`` block routine computes the
             intercept -- the fused Triton path ("fused", the default, which
             also matches the per-position losses' resolution default) or the

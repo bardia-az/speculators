@@ -511,6 +511,25 @@ class TestTauRbIntegration:
                 loss_implementation="eager",
             )
 
+    @pytest.mark.parametrize("implementation", ["eager", "fused"])
+    def test_tau_rb_rejects_reduced_verifier_head(self, implementation, monkeypatch):
+        logits, targets, token_ids, loss_mask = self._make_inputs()
+        # The verifier has twice as many tokens as its projected training head.
+        membership = torch.arange(2 * logits.shape[-1]) % 2 == 0
+        if implementation == "fused":
+            monkeypatch.setattr(
+                "speculators.models.dflash.metrics.tau_rb_fused_loss",
+                lambda *args, **kwargs: pytest.fail("reduced inputs reached fused loss"),
+            )
+        with pytest.raises(ValueError, match="requires the full verifier vocabulary"):
+            _compute_metrics(
+                logits, targets, loss_mask, self.block_size,
+                loss_config=resolve_loss_config('{"kl_div": 0.1, "tau_rb": 0.9}', "eager"),
+                token_ids=token_ids * 2,
+                t2d=membership,
+                loss_implementation=implementation,
+            )
+
     def test_tau_only_config(self):
         logits, targets, token_ids, loss_mask = self._make_inputs()
         config = resolve_loss_config("tau_rb", "eager")
