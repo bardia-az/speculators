@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 import warnings
 from pathlib import Path
@@ -525,6 +526,12 @@ class Trainer:
             train_kwargs = self.config.train_call_kwargs or {}
             if "prefix_seed" in train_kwargs:
                 gpu_batch["prefix_step"] = self.global_step
+            measure_step = os.environ.get("DFLEX_MEASURE_STEP") == str(self.global_step)
+            if measure_step:
+                accelerator = getattr(torch, self.device_type)
+                accelerator.synchronize()
+                accelerator.reset_peak_memory_stats()
+                step_start = time.perf_counter()
 
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
@@ -555,6 +562,31 @@ class Trainer:
                 type(opt).__name__: opt.param_groups[0]["lr"] for opt in self.optimizers
             }
             self._schedulers_step()
+            if measure_step:
+                accelerator.synchronize()
+                # Rank zero may be the only process with a visible console logger.
+                # Reduce integer counters after timing so every card is represented.
+                peaks = torch.tensor(
+                    [
+                        round((time.perf_counter() - step_start) * 1e6),
+                        accelerator.max_memory_allocated(),
+                        accelerator.max_memory_reserved(),
+                    ],
+                    dtype=torch.int64,
+                    device=loss.device,
+                )
+                if self.is_distributed:
+                    dist.all_reduce(peaks, op=dist.ReduceOp.MAX)
+                micros, allocated, reserved = peaks.tolist()
+                if self.rank == 0:
+                    root_logger.info(
+                        "DFlex full step %d, max across ranks: seconds=%.6f "
+                        "peak_allocated_bytes=%d peak_reserved_bytes=%d",
+                        self.global_step,
+                        micros / 1e6,
+                        allocated,
+                        reserved,
+                    )
             timer.mark("opt")
             t_before_fetch = timer.now() or time.perf_counter()
 
