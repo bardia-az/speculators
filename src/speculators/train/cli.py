@@ -419,6 +419,7 @@ def _build_from_config_only(
     d2t: torch.Tensor | None,
     verifier_name_or_path: str | None = None,
     draft_attn_impl: str | None = None,
+    config=None,
 ) -> SpeculatorModel:
     """Initialize a fresh draft from a saved speculator *config* (no weights).
 
@@ -426,7 +427,8 @@ def _build_from_config_only(
     speculator config, load vocab mappings, and pull verifier weights -- but with
     no trained draft weights to restore (decoder weights are randomly initialized).
     """
-    config = model_class.config_class.from_pretrained(path)
+    if config is None:
+        config = model_class.config_class.from_pretrained(path)
     if draft_attn_impl is not None:
         config.transformer_layer_config._attn_implementation = draft_attn_impl  # noqa: SLF001
     speculators_config = getattr(config, "speculators_config", None)
@@ -469,6 +471,19 @@ def build_draft_model(
     flags and ``--draft-config`` do not apply.
     """
     if args.from_pretrained:
+        config = None
+        if args.speculator_type == "dflex":
+            config = model_class.config_class.from_pretrained(args.from_pretrained)
+            options = model_class.prefix_settings(vars(args))
+            if args.num_blind_anchors is None and not getattr(
+                args, "override_max_anchors", False
+            ):
+                options.pop("num_blind_anchors", None)
+            if args.attention_mode is not None:
+                options["attention_mode"] = args.attention_mode
+            config = config.model_copy(update=options)
+            config._validate_prefix()
+            model_class._apply_serving_causal_hint(config)
         if is_config_only_dir(args.from_pretrained):
             logger.info(
                 "--from-pretrained points to a config-only directory ('%s'); "
@@ -478,6 +493,7 @@ def build_draft_model(
             return _build_from_config_only(
                 model_class,
                 args.from_pretrained,
+                config=config,
                 t2d=t2d,
                 d2t=d2t,
                 verifier_name_or_path=args.verifier_name_or_path,
@@ -490,7 +506,8 @@ def build_draft_model(
             # the CLI selection before construction -- mirroring from_training_args.
             # MTP is skipped: its from_training_args never sets the field and its
             # __init__ resolves its own default ("sdpa") when it is absent.
-            config = model_class.config_class.from_pretrained(args.from_pretrained)
+            if config is None:
+                config = model_class.config_class.from_pretrained(args.from_pretrained)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl  # noqa: SLF001
             # Same re-application for the causality hint: the flag is tri-state
             # (None = unspecified), and finetuned-from-release checkpoints either
@@ -501,19 +518,6 @@ def build_draft_model(
                 config, "sliding_window_non_causal"
             ):
                 config.sliding_window_non_causal = args.sliding_window_non_causal
-            # Same re-application for dflex's in-block attention mode: the
-            # flag is tri-state (None = keep the checkpoint's mode), and an
-            # explicit choice re-derives the serving-causality hint the same
-            # way from_training_args does at scratch-construction time.
-            if getattr(args, "attention_mode", None) is not None and hasattr(
-                config, "attention_mode"
-            ):
-                config.attention_mode = args.attention_mode
-                reapply_hint = getattr(
-                    model_class, "_apply_serving_causal_hint", None
-                )
-                if reapply_hint is not None:
-                    reapply_hint(config)
             return model_class.from_pretrained(
                 args.from_pretrained,
                 config=config,
@@ -656,6 +660,7 @@ def main(cfg: TrainConfig):  # noqa: C901
 
     model_class = registry[args.speculator_type]
 
+    args.override_max_anchors = "max_anchors" in cfg.data.model_fields_set
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
 
     # Get target layer IDs from the model (resolved at model level)
@@ -741,6 +746,15 @@ def main(cfg: TrainConfig):  # noqa: C901
 
     # Get trainer kwargs from model class
     train_call_kwargs, val_call_kwargs = model_class.get_trainer_kwargs(**vars(args))
+    if args.speculator_type == "dflex":
+        for call in (train_call_kwargs, val_call_kwargs):
+            call["max_anchors"] = draft_model.config.num_blind_anchors
+            if draft_model.config.uses_prefix_blocks:
+                if "tau_rb" in call["loss_config"]:
+                    raise ValueError(
+                        "tau_rb cannot be combined with DFlex prefix blocks"
+                    )
+                call["prefix_seed"] = args.seed
 
     trainer_config = TrainerConfig(
         num_epochs=args.epochs,

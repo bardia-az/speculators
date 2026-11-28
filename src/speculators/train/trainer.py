@@ -522,6 +522,10 @@ class Trainer:
                 for k, v in batch.items()
             }
 
+            train_kwargs = self.config.train_call_kwargs or {}
+            if "prefix_seed" in train_kwargs:
+                gpu_batch["prefix_step"] = self.global_step
+
             with torch.autocast(
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):
@@ -577,6 +581,23 @@ class Trainer:
                         "lr": lr_info,
                         "global_step": self.global_step,
                     },
+                    extra={"step": self.global_step},
+                )
+            elif "prefix_seed" in train_kwargs:
+                counts = {
+                    k: v
+                    for k, v in metrics.items()
+                    if k.startswith(
+                        ("num_blind_", "num_full_", "num_partial_", "partial_length_")
+                    )
+                }
+                if self.is_distributed:
+                    counts = _all_reduce_metrics(counts)
+                counts = normalize_counted_metrics(
+                    {k: v.item() for k, v in counts.items()}
+                )
+                metric_logger.info(
+                    {"train": counts, "global_step": self.global_step},
                     extra={"step": self.global_step},
                 )
             self.global_step += 1
@@ -640,7 +661,13 @@ class Trainer:
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):
                 _draft_tokens, _loss, metrics = self.model(
-                    **gpu_batch, **(self.config.val_call_kwargs or {})
+                    **gpu_batch,
+                    **(self.config.val_call_kwargs or {}),
+                    **(
+                        {"prefix_step": i}
+                        if "prefix_seed" in (self.config.val_call_kwargs or {})
+                        else {}
+                    ),
                 )
 
             for k, v in metrics.items():
