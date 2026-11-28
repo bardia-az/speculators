@@ -4,9 +4,23 @@ from typing import ClassVar
 import torch
 from transformers import PretrainedConfig
 
+from speculators.losses import kl_div_loss
 from speculators.model import SpeculatorModel
+from speculators.models.dflash.attention import create_anchor_block_mask_mod
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dflex.config import DFlexSpeculatorConfig
+from speculators.models.dflex.prefix import sample_prefix_layout
+from speculators.models.dflex.prefix_metrics import prefix_metrics
+
+PREFIX_FIELDS = (
+    "num_blind_anchors",
+    "num_full_anchors",
+    "num_partial_anchors",
+    "prefix_length_dist",
+    "prefix_length_ratio",
+    "lambda_ar",
+    "lambda_prefix",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +67,144 @@ class DFlexDraftModel(DFlashDraftModel):
         always in bounds.
         """
         return anchored_block_indices + 1
+
+    @staticmethod
+    def prefix_settings(args):
+        settings = {k: args[k] for k in PREFIX_FIELDS if args.get(k) is not None}
+        if "num_blind_anchors" not in settings and args.get("max_anchors") is not None:
+            settings["num_blind_anchors"] = args["max_anchors"]
+        return settings
+
+    def _prefix_forward(
+        self,
+        layout,
+        hidden_states,
+        input_ids,
+        verifier_last_hidden_states,
+        document_ids,
+        position_ids,
+    ):
+        width = input_ids.shape[1]
+        device = input_ids.device
+        if position_ids is None:
+            position_ids = torch.arange(width, device=device)[None, :]
+        positions = position_ids[0, layout.anchors[layout.block]] + layout.offset
+        positions = torch.cat((position_ids, positions[None, :]), dim=1)
+
+        def mask(window):
+            predicate, rows, cols = create_anchor_block_mask_mod(
+                document_ids[0],
+                width,
+                layout.anchors,
+                self.block_size,
+                sliding_window=window,
+                attention_mode=self.attention_mode,
+                prefix_layout=layout,
+            )
+            return self._create_mask_fn(
+                predicate, B=None, H=None, Q_LEN=rows, KV_LEN=cols, device=device
+            )
+
+        _, logits, teacher = self._decode_training_rows(
+            hidden_states,
+            verifier_last_hidden_states,
+            self.embed_tokens(layout.input_ids(input_ids, self.mask_token_id)),
+            positions,
+            layout.indices,
+            mask(None) if self.uses_full_attn else None,
+            mask(self.sliding_window) if self.uses_sliding_window_attn else None,
+        )
+        return logits, teacher
+
+    def forward(
+        self,
+        hidden_states,
+        input_ids,
+        loss_mask,
+        verifier_last_hidden_states,
+        document_ids,
+        position_ids=None,
+        loss_config=None,
+        gamma=4.0,
+        max_anchors=None,
+        per_position_loss_weight="fixed-exp-decay",
+        dpace_alpha=0.5,
+        target_temperature=1.0,
+        loss_implementation="fused",
+        prefix_seed=42,
+        prefix_step=0,
+        **kwargs,
+    ):
+        enabled = self.config.uses_prefix_blocks
+        if enabled and loss_config and "tau_rb" in loss_config:
+            raise ValueError("tau_rb cannot be combined with DFlex prefix blocks")
+        if enabled and getattr(self, "t2d", None) is not None:
+            raise ValueError(
+                "DFlex prefix acceptance metrics require full verifier vocabulary"
+            )
+        stats = {}
+        _, blind, metrics = super().forward(
+            hidden_states,
+            input_ids,
+            loss_mask,
+            verifier_last_hidden_states,
+            document_ids,
+            position_ids,
+            loss_config,
+            gamma,
+            self.config.num_blind_anchors if max_anchors is None else max_anchors,
+            per_position_loss_weight,
+            dpace_alpha,
+            target_temperature,
+            loss_implementation,
+            blind_stats=stats,
+            **kwargs,
+        )
+        metrics.update(stats)
+        metrics["blind_loss_sum"] = metrics["loss_sum"]
+        metrics["blind_loss_total"] = metrics["loss_total"]
+        if not enabled:
+            metrics["total_loss_sum"] = metrics["loss_sum"]
+            metrics["total_loss_total"] = metrics["loss_total"]
+            return None, blind, metrics
+
+        # Step is restored by the trainer on resume. Validation uses batch index.
+        # Draws happen on CPU with a dedicated generator. Protect the blind RNG
+        # stream as well if the transformer config enables attention dropout.
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        seed = (
+            prefix_seed + 1_000_003 * prefix_step + 97 * rank + int(self.training)
+        ) % (2**63)
+        layout = sample_prefix_layout(self.config, loss_mask, document_ids, seed)
+        logits = targets = None
+        if layout.offset.numel():
+            device = input_ids.device
+            devices = [] if device.type == "cpu" else [device]
+            with torch.random.fork_rng(devices=devices, device_type=device.type):
+                logits, targets = self._prefix_forward(
+                    layout,
+                    hidden_states,
+                    input_ids,
+                    verifier_last_hidden_states,
+                    document_ids,
+                    position_ids,
+                )
+        valid = loss_mask[:, self._loss_mask_gather_indices(layout.indices)]
+        prefix, stats = prefix_metrics(
+            self.config,
+            layout,
+            logits,
+            targets,
+            valid,
+            loss_config or {"kl_div": (kl_div_loss, 1.0)},
+            gamma,
+            self.training,
+        )
+        total = blind + self.config.lambda_prefix * prefix
+        metrics.update(stats)
+        metrics["total_loss_sum"] = total.detach()
+        metrics["total_loss_total"] = metrics["loss_total"]
+        return None, total, metrics
 
     @staticmethod
     def _apply_serving_causal_hint(config: DFlexSpeculatorConfig) -> None:
@@ -102,7 +254,8 @@ class DFlexDraftModel(DFlashDraftModel):
             )
         kwargs["sample_from_anchor"] = True
         config = DFlexSpeculatorConfig(
-            **cls._build_base_config_kwargs("dflex", verifier_config, **kwargs)
+            **cls._build_base_config_kwargs("dflex", verifier_config, **kwargs),
+            **cls.prefix_settings(kwargs),
         )
         cls._apply_serving_causal_hint(config)
         model = cls(config=config)
