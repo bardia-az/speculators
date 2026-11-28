@@ -5,14 +5,7 @@ from torch.nn.attention.flex_attention import (
 
 
 def _is_real_token(block_offset: torch.Tensor) -> torch.Tensor:
-    """Which in-block offsets hold real (non-mask) tokens.
-
-    Today only the anchor (offset 0) is real: block queries are
-    ``[anchor, MASK x (block_size - 1)]``. The later multi-real phase --
-    several leading block positions holding real tokens -- changes this
-    predicate alone; the visibility rules below are already written in terms
-    of it.
-    """
+    """Blind blocks contain one real token at offset zero."""
     return block_offset == 0
 
 
@@ -24,6 +17,7 @@ def create_anchor_block_mask_mod(
     sliding_window: int | None = None,
     sliding_window_non_causal: bool = False,
     attention_mode: str | None = None,
+    prefix_layout=None,
 ):
     """
     Build a flex-attention mask mod where each query block corresponds to one anchor.
@@ -82,18 +76,26 @@ def create_anchor_block_mask_mod(
 
     n_anchors = anchor_positions.numel()
     q_len = n_anchors * block_size
+    if prefix_layout is not None:
+        q_len = prefix_layout.offset.numel()
     kv_len = total_seq_len + q_len
 
     # For each query position, which anchor does it belong to?
     # query q in [j*block_size, (j+1)*block_size) belongs to anchor_positions[j]
-    query_anchor_positions = torch.repeat_interleave(anchor_positions, block_size)
+    if prefix_layout is None:
+        query_anchor_positions = torch.repeat_interleave(anchor_positions, block_size)
+    else:
+        query_anchor_positions = anchor_positions[prefix_layout.block]
+        row_real = prefix_layout.real
 
     def base_prefix_mod(_b, _h, q_idx, kv_idx):
         """
         Queries may see base-sequence tokens in the same document before the anchor.
         """
         # absolute base position
-        q_anchor = query_anchor_positions[q_idx]
+        q_anchor = query_anchor_positions[
+            q_idx if prefix_layout is None else q_idx % q_len
+        ]
         # doc id for this query block
         q_doc = document_ids[q_anchor]
 
@@ -148,6 +150,22 @@ def create_anchor_block_mask_mod(
         kv_is_block = kv_idx >= total_seq_len
         kv_block = (kv_idx - total_seq_len) // block_size
 
+        if prefix_layout is not None:
+            # FlexAttention may evaluate the predicate at rounded tile indices.
+            q_row = q_idx % q_len
+            k_row = (kv_idx - total_seq_len) % q_len
+            return (
+                kv_is_block
+                & (kv_idx < kv_len)
+                & (q_idx < q_len)
+                & (prefix_layout.block[q_row] == prefix_layout.block[k_row])
+                & _in_block_visible(
+                    prefix_layout.offset[q_row],
+                    prefix_layout.offset[k_row],
+                    row_real[q_row],
+                    row_real[k_row],
+                )
+            )
         same = kv_is_block & (q_block == kv_block)
         if attention_mode is not None:
             # Within-block offsets. kv_offset is only meaningful for

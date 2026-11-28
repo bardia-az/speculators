@@ -460,6 +460,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
         num_anchors = kwargs.pop("max_anchors", 512)
+        blind_stats = kwargs.pop("blind_stats", None)
 
         if position_ids is None:
             position_ids = torch.arange(
@@ -482,23 +483,82 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
-        target_features = self._context_features(hidden_states)
-        # fused mode: one shared feature; per-layer variants carry one
-        # extracted hidden state per draft layer (see _context_features)
-
         mask_position_ids = get_base_indices_for_anchored_blocks(
             position_ids[0, anchor_positions], self.block_size
         )
         position_ids = torch.cat([position_ids, mask_position_ids.unsqueeze(0)], dim=1)
         # shape: [1, total_seq_len + num_anchors*block_size]
 
-        # the hidden_states shape doesn't match position_ids but doesn't need
-        # to, as hidden_states is only used to set dtype and device in rotary_emb
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
         anchored_block_indices = get_base_indices_for_anchored_blocks(
             anchor_positions, self.block_size
         )  # shape: [num_anchors*block_size]
+        hidden, logits, targets = self._decode_training_rows(
+            hidden_states,
+            verifier_last_hidden_states,
+            noise_embedding,
+            position_ids,
+            anchored_block_indices,
+            full_attn_mask,
+            sliding_window_attn_mask,
+            **kwargs,
+        )
+
+        aligned_loss_mask = loss_mask.clone()[
+            :, self._loss_mask_gather_indices(anchored_block_indices)
+        ]
+        # shape: [1, num_anchors*block_size]
+
+        # zero out any padded anchor blocks
+        aligned_loss_mask = aligned_loss_mask * (
+            anchor_valid.repeat_interleave(self.block_size)
+            .unsqueeze(0)
+            .to(aligned_loss_mask.dtype)
+        )  # shape: [1, num_anchors*block_size]
+
+        # For sample_from_anchor=False, mask slot 0 (anchor) since it's not trained
+        if not self.config.sample_from_anchor:
+            aligned_loss_mask[:, :: self.block_size] = 0
+
+        if blind_stats is not None:
+            docs = document_ids[0]
+            label_docs = docs[self._loss_mask_gather_indices(anchored_block_indices)]
+            crosses = label_docs != docs[anchor_positions].repeat_interleave(
+                self.block_size
+            )
+            crosses = crosses & aligned_loss_mask[0].bool()
+            blind_stats.update(
+                {
+                    "num_blind_anchors_sum": anchor_valid.sum(),
+                    "num_blind_anchors_total": anchor_valid.new_ones(
+                        (), dtype=torch.long
+                    ),
+                    "blind_cross_doc_blocks_sum": crosses.view(-1, self.block_size)
+                    .any(-1)
+                    .sum(),
+                    "blind_cross_doc_blocks_total": anchor_valid.sum(),
+                    "blind_cross_doc_tokens_sum": crosses.sum(),
+                    "blind_cross_doc_tokens_total": aligned_loss_mask.bool().sum(),
+                }
+            )
+        return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
+
+    def _decode_training_rows(
+        self,
+        hidden_states,
+        verifier_last_hidden_states,
+        noise_embedding,
+        position_ids,
+        anchored_block_indices,
+        full_attn_mask,
+        sliding_window_attn_mask,
+        **kwargs,
+    ):
+        """Decode prepared query rows and gather their aligned teacher logits."""
+        total_seq_len = hidden_states.shape[1]
+        target_features = self._context_features(hidden_states)
+        # the hidden_states shape doesn't match position_ids but doesn't need
+        # to, as hidden_states is only used to set dtype and device in rotary_emb
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         with torch.no_grad():
             if anchored_block_indices.numel() < total_seq_len:
@@ -534,25 +594,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         hidden = self.norm(noise_embedding)
         logits = self.lm_head(hidden)
-        # shape: [1, num_anchors*block_size, vocab_size]
-
-        aligned_loss_mask = loss_mask.clone()[
-            :, self._loss_mask_gather_indices(anchored_block_indices)
-        ]
-        # shape: [1, num_anchors*block_size]
-
-        # zero out any padded anchor blocks
-        aligned_loss_mask = aligned_loss_mask * (
-            anchor_valid.repeat_interleave(self.block_size)
-            .unsqueeze(0)
-            .to(aligned_loss_mask.dtype)
-        )  # shape: [1, num_anchors*block_size]
-
-        # For sample_from_anchor=False, mask slot 0 (anchor) since it's not trained
-        if not self.config.sample_from_anchor:
-            aligned_loss_mask[:, :: self.block_size] = 0
-
-        return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
+        return hidden, logits, targets
 
     @conditional_torch_compile
     def forward(

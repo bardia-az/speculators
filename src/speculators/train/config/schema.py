@@ -524,6 +524,40 @@ class DFlashArgs(_Group):
         description="Smoothing constant for the D-PACE loss (default: 0.5). Must be in "
         "(0, 1] when --per-position-loss-weight=dpace.",
     )
+    num_blind_anchors: int | None = Field(
+        default=None,
+        gt=0,
+        description="DFlex blind blocks per rank (alias for max_anchors).",
+    )
+    num_full_anchors: int | None = Field(
+        default=None,
+        ge=0,
+        description="Additional fully revealed DFlex blocks per rank.",
+    )
+    num_partial_anchors: int | None = Field(
+        default=None, ge=0, description="Additional partial DFlex blocks per rank."
+    )
+    prefix_length_dist: Literal["geometric", "uniform"] | None = Field(
+        default=None, description="Distribution of partial block real lengths."
+    )
+    prefix_length_ratio: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Ratio of adjacent geometric length probabilities.",
+    )
+    lambda_ar: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        description="AR weight in the DFlex prefix objective.",
+    )
+    lambda_prefix: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        description="Weight of the DFlex prefix objective.",
+    )
     attention_mode: Literal["bidirectional", "causal", "hybrid"] | None = Field(
         default=None,
         description="In-block draft attention visibility (dflex only): "

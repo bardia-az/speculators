@@ -50,6 +50,26 @@ class DFlexSpeculatorConfig(DFlashSpeculatorConfig):
             "time; hybrid has no serving representation."
         ),
     )
+    num_blind_anchors: int = Field(default=512, gt=0)
+    num_full_anchors: int = Field(default=0, ge=0)
+    num_partial_anchors: int = Field(default=0, ge=0)
+    prefix_length_dist: Literal["geometric", "uniform"] = "geometric"
+    prefix_length_ratio: float = Field(default=0.8, gt=0, allow_inf_nan=False)
+    lambda_ar: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    lambda_prefix: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+
+    @property
+    def uses_prefix_blocks(self) -> bool:
+        return bool(self.num_full_anchors or self.num_partial_anchors)
+
+    @model_validator(mode="after")
+    def _validate_prefix(self) -> "DFlexSpeculatorConfig":
+        if self.uses_prefix_blocks and self.attention_mode == "bidirectional":
+            raise ValueError("DFlex prefix blocks require causal or hybrid attention")
+        if self.num_partial_anchors and self.block_size <= 1:
+            raise ValueError("Partial blocks require block_size >= 2")
+        return self
+
     sample_from_anchor: bool = Field(
         default=True,
         description=(
