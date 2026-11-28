@@ -424,14 +424,15 @@ class TestTrainingArgsAndConfig:
         assert dumped["speculators_model_type"] == "dflex"
         assert dumped["sample_from_anchor"] is True
 
-    def test_build_base_config_kwargs_dflex(self):
+    def test_build_base_config_kwargs_dflex(self, tmp_path):
         verifier_config = Qwen3Config(hidden_size=HIDDEN, num_hidden_layers=36)
+        verifier_config.save_pretrained(str(tmp_path))
         kwargs = DFlexDraftModel._build_base_config_kwargs(
             "dflex",
             verifier_config,
             draft_vocab_size=VOCAB,
             block_size=15,
-            verifier_name_or_path="Qwen/Qwen3-4B",
+            verifier_name_or_path=str(tmp_path),
             target_layer_ids=[2, 10, 18, 26, 34],
         )
         assert kwargs["sample_from_anchor"] is True

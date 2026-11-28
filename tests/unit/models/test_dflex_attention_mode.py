@@ -349,16 +349,19 @@ class TestConfigPlumbing:
 # ---------------------------------------------------------------------------
 
 
-def _tiny_dflex(attention_mode: str | None = "bidirectional",
-                block_size: int = BLOCK,
-                impl: str = "eager") -> DFlexDraftModel:
+def _tiny_dflex(
+    attention_mode: str | None = "bidirectional",
+    block_size: int = BLOCK,
+    impl: str = "eager",
+    num_layers: int = 1,
+) -> DFlexDraftModel:
     # ``None`` (the legacy rule, kept verbatim for configs that predate the
     # field) is a model-level state, not a config value: the pydantic field
     # only accepts the three modes. Simulate a field-less config by
     # overriding the resolved attribute after construction.
     torch.manual_seed(1234)  # identical decoder weights across constructions
     config = DFlexSpeculatorConfig(
-        transformer_layer_config=_toy_tl_config(impl=impl),
+        transformer_layer_config=_toy_tl_config(impl=impl, num_layers=num_layers),
         draft_vocab_size=VOCAB,
         block_size=block_size,
         aux_hidden_state_layer_ids=[0, 1],
@@ -395,7 +398,13 @@ def _toy_batch(loss_mask: torch.Tensor):
     hidden_states = torch.randn(1, SEQ_LEN, 2 * HIDDEN)
     verifier_last_hidden_states = torch.eye(HIDDEN)[:SEQ_LEN].unsqueeze(0)
     document_ids = torch.zeros(1, SEQ_LEN, dtype=torch.long)
-    return hidden_states, _toy_ids(), loss_mask, verifier_last_hidden_states, document_ids
+    return (
+        hidden_states,
+        _toy_ids(),
+        loss_mask,
+        verifier_last_hidden_states,
+        document_ids,
+    )
 
 
 def _mask_from(valid_positions) -> torch.Tensor:
