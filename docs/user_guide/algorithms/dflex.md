@@ -59,7 +59,7 @@ dflex-only) governs **in-block visibility**: which positions of a draft block
 `[anchor, MASK x (B-1)]` may attend to each other. Context visibility —
 target-context features strictly before the anchor, never other blocks — is
 the same in every mode. Within a block, each position is either a **real
-token** (today only the anchor, block offset 0) or a **mask**:
+token** in the leading prefix or a **mask**.
 
 | Mode | In-block rule |
 | ---- | ------------- |
@@ -69,11 +69,14 @@ token** (today only the anchor, block offset 0) or a **mask**:
 
 The rule is implemented as a pure predicate over `(q_offset, kv_offset,
 q_is_real, kv_is_real)` in `create_anchor_block_mask_mod`
-(`speculators/models/dflash/attention.py`); `_is_real_token` (offset == 0) is
-the single definition of which positions are real, so a later multi-real
-phase only changes that predicate. Because it lives in the shared mask
-builder, all attention backends (flex block masks, SDPA, eager) and the
-fork's own inference forward follow it from one place.
+in `speculators/models/dflash/attention.py`. Blind blocks have one real row.
+Variable-width prefix blocks supply an offset, owning block and real-prefix
+length for each query and key. Causal and hybrid training accept additional
+full blocks (`--num-full-anchors`) and partial blocks (`--num-partial-anchors`),
+both defaulting to zero. The full block scores K autoregressive labels.
+The partial block scores l−1 autoregressive labels followed by K draft
+labels. The objective adds the separately normalized prefix terms to the
+blind loss, with `--lambda-ar` and `--lambda-prefix` defaulting to 1.
 
 Semantics and interaction with the legacy rule:
 
